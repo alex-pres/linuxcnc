@@ -8726,7 +8726,7 @@ msgstr "Краткое руководство по оси"
 
 #: share/axis/tcl/axis.tcl:1756
 msgid "AXIS $::version on $::machine"
-msgstr "ОСЬ $::версия на $::станке"
+msgstr "ОСЬ $::version на $::machine"
 
 #: share/axis/tcl/axis.tcl:1758
 msgid "(no file)"
