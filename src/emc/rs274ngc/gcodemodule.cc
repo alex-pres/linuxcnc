@@ -50,6 +50,8 @@
 #include "nml_intf/interp_return.hh"
 #include "nml_intf/canon.hh"
 
+#include "gcode_renderer.hh"
+
 int _task = 0; // control preview behaviour when remapping
 
 char _parameter_file_name[LINELEN];
@@ -182,9 +184,9 @@ static PyTypeObject LineCodeType = {
 };
 #pragma GCC diagnostic pop
 
-static PyObject *callback;
-static int interp_error;
-static int last_sequence_number;
+PyObject *callback;
+int interp_error;
+int last_sequence_number;
 static int selected_tool = 0;
 static bool metric;
 static double _pos_x, _pos_y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w;
@@ -192,260 +194,26 @@ EmcPose tool_offset;
 
 static InterpBase *pinterp;
 
-#define callmethod(o, m, f, ...) PyObject_CallMethod((o), (char*)(m), (char*)(f), ## __VA_ARGS__)
-
-// ---------------------------------------------------------------------------
-// The move-batch protocol
-// ---------------------------------------------------------------------------
-//
-// An *opt-in* alternative to the per-event callback protocol, for consumers
-// that would rather receive a million moves as a few numpy-shaped blocks than
-// as a million Python calls. A canon object opts in by setting
-// `use_move_batches = True` and providing a callable `move_batch`; both are
-// read once, in parse_file, before any interpretation. Everything below is
-// inert when the flag is absent, and the legacy callback sequence is then
-// byte-for-byte what it always was.
-//
-// The flag must be a *bool*, not merely truthy: a canon that answers every
-// unknown attribute with a stub - `def __getattr__(self, name): return lambda
-// *a: None`, a common idiom for partial canons, and what
-// tests/interp_initcode's does - would otherwise hand back a callable for both
-// `use_move_batches` and `move_batch` and be opted in without ever asking,
-// silently dropping every batched move into the stub.
-//
-// In batch mode the canon functions listed under `MoveBatch::Kind` do not call
-// Python at all. Each appends one fixed-width row of 13 float64s to a C-owned
-// buffer:
-//
-//     [kind, line_number, x, y, z, a, b, c, u, v, w, feedrate, spindle_speed]
-//
-// Move rows (kinds 0-3) carry exactly the axis values the legacy call would
-// have passed - after the `_pos_*` update and after the metric division - so a
-// consumer reproduces the legacy geometry bit for bit. Rigid-tap rows carry
-// x,y,z and zeros for a..w, as the legacy `rigid_tap` callback did.
-//
-// Non-move rows keep the row width by carrying their payload in the axis
-// slots, zeros elsewhere:
-//
-//     dwell (4)        seconds in x
-//     m1xx  (5)        function index, P, Q in x, y, z
-//     change_tool (6)  tool number in x
-//     tool_offset (7)  the nine offsets in x..w
-//
-// `feedrate` is the last SET_FEED_RATE value, post-conversion, so a consumer
-// never has to correlate rows with a separate rate callback; it starts at 60.0
-// because GLCanon starts at feedrate 1 (= rate/60). `spindle_speed` is the last
-// SET_SPINDLE_SPEED for spindle 0 - data the legacy protocol never delivered,
-// since that canon call is an empty stub - carried here so an S word costs
-// nothing and never fragments a batch.
-//
-// Ordering: the buffer is flushed before *any* still-forwarded Python callback,
-// which is guaranteed by flushing at the top of maybe_new_line() - see the
-// invariant comment there - and also when full, before the periodic
-// check_abort(), and at end of parse. What deliberately does NOT flush is
-// anything whose effect the rows already carry: the batched events (a G81 cycle
-// emits a DWELL per hole, and flushing on those would shred a 100k-hole file
-// into four-row batches) and SET_FEED_RATE / SET_SPINDLE_SPEED (both travel in
-// the row's own columns; CAM output with adaptive feed emits an F word every
-// few moves, and flushing there made batch mode slower than the protocol it
-// replaces - see SET_FEED_RATE).
-//
-// Lifetime: rows are delivered as a read-only memoryview over the buffer, valid
-// only for the duration of the move_batch call - the consumer must copy or
-// fully consume it before returning. The buffer is allocated once and never
-// freed or reallocated, so a consumer that illegally retains the view reads
-// stale numbers rather than freed memory.
-//
-// Ownership: like every other piece of canon state in this file (`callback`,
-// `pinterp`, `metric`, `_pos_*`), the buffer is per-process, not per-parse -
-// there is exactly one copy, since this translation unit is linked into
-// lib/python/gcode.so and nothing else. `interp_from_shlib` swaps the
-// *interpreter*, not the canon, so an alternate interpreter still appends here.
-// What the batch protocol adds is a way for that to fail *quietly*: a second
-// parse_file entered while one is in flight (gcode.parse is not reentrant, and
-// AXIS's check_abort pumps the Tk event loop) would re-arm the buffer for a
-// different canon, and the outer parse's rows would then be delivered to the
-// inner parse's consumer. Hence `owner_`: the canon the buffer was armed for,
-// compared - never dereferenced - on every append and flush, so a mismatch
-// raises instead of misdelivering.
-//
-// Opting a GUI in is a separate change; nothing in tree sets the flag yet.
-
-class MoveBatch {
-public:
-    // Column 0 of a row. Values are protocol, not implementation detail: a
-    // consumer switches on them, so they may be appended to but never
-    // renumbered. Kinds 0-3 are moves; 4-7 carry the payloads listed above.
-    enum Kind : int {
-        Traverse = 0,
-        Feed = 1,
-        Probe = 2,
-        RigidTap = 3,
-        Dwell = 4,
-        M1xx = 5,
-        ChangeTool = 6,
-        ToolOffset = 7,
-    };
-
-    static constexpr int ROW = 13;      // float64s per row, per the layout above
-    // Rows per delivery: 1.7 MB of buffer, and the size the consumer's
-    // per-batch numpy temporaries are proportional to. Measured on 500k moves
-    // (aarch64 dev container): 65536 costs ~32 MB more peak RSS than the
-    // per-move canon for no gain, while 16384 and 4096 both land at the
-    // per-move canon's peak exactly and run marginally faster. 16384 is the
-    // larger of the two that costs nothing, leaving headroom for a consumer
-    // whose per-batch overhead is higher than the reference one's.
-    static constexpr int CAP = 16384;
-
-    // Read the opt-in off `canon` and, if it is set, make the buffer ready for
-    // it. Returns false with a Python exception set; true means the parse may
-    // proceed, in whichever protocol active() now reports.
-    static bool arm(PyObject *canon) {
-        owner_ = nullptr;
-        count_ = 0;
-        rate_ = 60.0;
-        rate_seen_ = false;
-        speed_ = 0.0;
-        PyObject *flag = PyObject_GetAttrString(canon, "use_move_batches");
-        if(!flag) {
-            if(!PyErr_ExceptionMatches(PyExc_AttributeError)) return false;
-            PyErr_Clear();              // no attribute: the legacy protocol
-            return true;
-        }
-        // Anything that is not a bool is not an opt-in - see the note on
-        // catch-all `__getattr__` above. Legacy protocol, no complaint: a
-        // canon that never mentions the flag must not be made to fail.
-        bool opted_in = PyBool_Check(flag) && flag == Py_True;
-        Py_DECREF(flag);
-        if(!opted_in) return true;
-        // Fail fast rather than fall back: a canon that asked for batches and
-        // silently got per-move callbacks would look like it worked and quietly
-        // build a different program.
-        PyObject *consumer = PyObject_GetAttrString(canon, "move_batch");
-        bool usable = consumer && PyCallable_Check(consumer);
-        Py_XDECREF(consumer);
-        if(!usable) {
-            PyErr_Clear();
-            PyErr_SetString(PyExc_TypeError,
-                    "parse: canon sets use_move_batches but has no callable "
-                    "move_batch");
-            return false;
-        }
-        if(!buf_) {
-            buf_ = (double*)malloc((size_t)CAP * ROW * sizeof(double));
-            if(!buf_) { PyErr_NoMemory(); return false; }
-        }
-        owner_ = canon;
-        return true;
-    }
-
-    static bool active() { return owner_ != nullptr; }
-
-    static void append(Kind kind, int line_number,
-                       double x, double y, double z,
-                       double a, double b, double c,
-                       double u, double v, double w) {
-        if(!owned()) return;
-        double *row = buf_ + (size_t)count_ * ROW;
-        row[0] = static_cast<double>(kind);
-        row[1] = line_number;
-        row[2] = x; row[3] = y; row[4] = z;
-        row[5] = a; row[6] = b; row[7] = c;
-        row[8] = u; row[9] = v; row[10] = w;
-        row[11] = rate_;
-        row[12] = speed_;
-        count_ ++;
-        // No next_line is delivered for a batched row, but the error line the
-        // parse reports must still advance with it.
-        last_sequence_number = line_number;
-        if(count_ >= CAP) flush();
-    }
-
-    static void flush() {
-        if(!active()) return;
-        if(count_ == 0) return;
-        // Never call into Python with an exception pending: the consumer would
-        // be handed a broken interpreter state, and the error we already have
-        // is the one worth reporting.
-        if(interp_error) return;
-        if(!owned()) return;
-        int n = count_;
-        // Reset before the call, not after: if move_batch raises, these rows
-        // have still been handed over once, and re-delivering them from a later
-        // flush would duplicate them in the consumer's program.
-        count_ = 0;
-        PyObject *view = PyMemoryView_FromMemory((char*)buf_,
-                (Py_ssize_t)n * ROW * sizeof(double), PyBUF_READ);
-        if(!view) { interp_error ++; return; }
-        PyObject *result = callmethod(callback, "move_batch", "O", view);
-        Py_DECREF(view);
-        if(result == NULL) interp_error ++;
-        Py_XDECREF(result);
-    }
-
-    // Record the rate the following rows will carry, and answer whether it
-    // actually moved. The interpreter reports an F word whether or not it
-    // changes anything - interp_execute.cc branches on `block->f_flag` alone,
-    // with no comparison against settings->feed_rate - so CAM output that
-    // repeats the same `F600` on every line calls in here once per move. In
-    // batch mode there is nothing to say about a rate that did not change: the
-    // value already reached the consumer in every row's feedrate column. The
-    // first call of a parse always counts as a change, so a consumer's own
-    // starting feed rate is set from the file even when the file opens with the
-    // same 60.0 this starts at.
-    static bool feed_rate(double rate) {
-        if(rate == rate_ && rate_seen_) return false;
-        rate_ = rate;
-        rate_seen_ = true;
-        return true;
-    }
-
-    // Tracked whether or not batch mode is on - one store, and in legacy mode
-    // nothing ever reads it. There is no callback to suppress here: this canon
-    // call has never forwarded anything.
-    static void spindle_speed(double rpm) { speed_ = rpm; }
-
-private:
-    MoveBatch() = delete;
-
-    // Is the buffer still the one armed for the canon being parsed into? Only
-    // a re-entered parse_file can make this false; say so rather than deliver
-    // one canon's moves to another.
-    static bool owned() {
-        if(owner_ == callback) return true;
-        PyErr_SetString(PyExc_RuntimeError,
-                "gcode.parse: the move batch belongs to a different canon - "
-                "gcode.parse was re-entered");
-        interp_error ++;
-        return false;
-    }
-
-    static inline PyObject *owner_ = nullptr;   // compared, never dereferenced
-    static inline double *buf_ = nullptr;
-    static inline int count_ = 0;
-    static inline double rate_ = 60.0;
-    static inline bool rate_seen_ = false;
-    static inline double speed_ = 0.0;
-};
-
-// The `next_line` delivery guard, split off from last_sequence_number: batched
-// rows advance that one (parse_file returns it, and error reporting reads it)
-// without a next_line having been delivered, so a still-forwarded callback
-// later on the same line must not be mistaken for a repeat. The two move in
-// lockstep in legacy mode, where nothing but delivery touches either.
+// The `next_line` delivery guard, split off from last_sequence_number: a
+// rendered move advances that one (parse_file returns it, and error reporting
+// reads it) without a next_line having been delivered, so a still-forwarded
+// callback later on the same line must not be mistaken for a repeat. The two
+// move in lockstep on the callback protocol, where nothing but delivery
+// touches either.
 static int last_delivered_sequence_number;
 
 static void maybe_new_line(int sequence_number);
 static void maybe_new_line();
 
-// The line number for a batched event whose canon function is not given one.
-static int batch_line_number() {
+// The line number for a rendered event whose canon function is not given one.
+static int renderer_line_number() {
     return pinterp ? pinterp->sequence_number() : last_sequence_number;
 }
 
-// Deliver next_line, without flushing. Split out for SET_FEED_RATE, which is
-// the one forwarder whose state the batch rows already carry - see there. In
-// legacy mode this *is* maybe_new_line(), since the flush is a no-op.
+// Deliver next_line, without reporting progress. Split out for SET_FEED_RATE,
+// which is the one forwarder a progress bar has nothing to learn from - see
+// there. On the callback protocol this *is* maybe_new_line(), since the report
+// is a no-op.
 static void deliver_new_line(int sequence_number) {
     if(!pinterp) return;
     if(interp_error) return;
@@ -467,14 +235,12 @@ static void deliver_new_line(int sequence_number) {
 }
 
 static void maybe_new_line(int sequence_number) {
-    // INVARIANT: every canon function that forwards a Python callback calls
-    // maybe_new_line() first, and this flush is what makes that the batch
-    // protocol's ordering guarantee - pending rows are delivered before the
-    // callback that would change the state they were produced under. A new
-    // forwarder added without this call would silently deliver its callback
-    // ahead of moves that preceded it; the legacy-vs-batch equality test is
-    // the tripwire for that. The one deliberate exception is SET_FEED_RATE.
-    MoveBatch::flush();
+    // Every canon function that forwards a Python callback calls
+    // maybe_new_line() first, so this is where the renderer's progress report
+    // lands: once per source line that produced anything, which is what a GUI
+    // counts now that a rendered move delivers no next_line. The one
+    // deliberate exception is SET_FEED_RATE - see there.
+    GCodeRenderer::progress();
     deliver_new_line(sequence_number);
 }
 
@@ -602,6 +368,14 @@ void ARC_FEED(int line_number,
         v_position /= 25.4;
         w_position /= 25.4;
     }
+    if(GCodeRenderer::active()) {
+        if(interp_error) return;
+        GCodeRenderer::arc(line_number, first_end, second_end, first_axis,
+                           second_axis, rotation, axis_end_point,
+                           a_position, b_position, c_position,
+                           u_position, v_position, w_position);
+        return;
+    }
     maybe_new_line(line_number);
     if(interp_error) return;
     PyObject *result =
@@ -622,9 +396,10 @@ void STRAIGHT_FEED(int line_number,
     _pos_a=a; _pos_b=b; _pos_c=c;
     _pos_u=u; _pos_v=v; _pos_w=w;
     if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    if(MoveBatch::active()) {
+    if(GCodeRenderer::active()) {
         if(interp_error) return;
-        MoveBatch::append(MoveBatch::Feed, line_number, x, y, z, a, b, c, u, v, w);
+        GCodeRenderer::append(GCodeRenderer::Feed, line_number,
+                              x, y, z, a, b, c, u, v, w);
         return;
     }
     maybe_new_line(line_number);
@@ -644,9 +419,10 @@ void STRAIGHT_TRAVERSE(int line_number,
     _pos_a=a; _pos_b=b; _pos_c=c;
     _pos_u=u; _pos_v=v; _pos_w=w;
     if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    if(MoveBatch::active()) {
+    if(GCodeRenderer::active()) {
         if(interp_error) return;
-        MoveBatch::append(MoveBatch::Traverse, line_number, x, y, z, a, b, c, u, v, w);
+        GCodeRenderer::append(GCodeRenderer::Traverse, line_number,
+                              x, y, z, a, b, c, u, v, w);
         return;
     }
     maybe_new_line(line_number);
@@ -669,6 +445,10 @@ void SET_G5X_OFFSET(int g5x_index,
         callmethod(callback, "set_g5x_offset", "ifffffffff",
                             g5x_index, x, y, z, a, b, c, u, v, w);
     if(result == NULL) interp_error ++;
+    else {
+        const double offsets[9] = {x, y, z, a, b, c, u, v, w};
+        GCodeRenderer::set_g5x(offsets);
+    }
     Py_XDECREF(result);
 }
 
@@ -682,6 +462,10 @@ void SET_G92_OFFSET(double x, double y, double z,
         callmethod(callback, "set_g92_offset", "fffffffff",
                             x, y, z, a, b, c, u, v, w);
     if(result == NULL) interp_error ++;
+    else {
+        const double offsets[9] = {x, y, z, a, b, c, u, v, w};
+        GCodeRenderer::set_g92(offsets);
+    }
     Py_XDECREF(result);
 }
 
@@ -691,12 +475,14 @@ void SET_XY_ROTATION(double t) {
     PyObject *result =
         callmethod(callback, "set_xy_rotation", "f", t);
     if(result == NULL) interp_error ++;
+    else GCodeRenderer::set_rotation_xy(t);
     Py_XDECREF(result);
 };
 
 void USE_LENGTH_UNITS(CANON_UNITS u) { metric = u == CANON_UNITS_MM; }
 
 void SELECT_PLANE(CANON_PLANE pl) {
+    GCodeRenderer::note_plane(static_cast<int>(pl));
     maybe_new_line();   
     if(interp_error) return;
     PyObject *result =
@@ -726,9 +512,9 @@ void SET_FEED_MODE(int /*spindle*/, int /*mode*/) {
 }
 
 void CHANGE_TOOL() {
-    if(MoveBatch::active()) {
+    if(GCodeRenderer::active()) {
         if(interp_error) return;
-        MoveBatch::append(MoveBatch::ChangeTool, batch_line_number(),
+        GCodeRenderer::append(GCodeRenderer::ChangeTool, renderer_line_number(),
                      selected_tool, 0, 0, 0, 0, 0, 0, 0, 0);
         return;
     }
@@ -756,25 +542,23 @@ void RELOAD_TOOLDATA(void) {
  */
 void SET_FEED_RATE(double rate) {
     if(metric) rate /= 25.4;
-    if(MoveBatch::active()) {
-        // Two departures here, both because the rate is already in every row.
+    if(GCodeRenderer::active()) {
+        // Two departures here, both because the renderer already has the rate.
         //
-        // It does not flush. There is nothing a batch boundary would tell the
-        // consumer that the feedrate column has not. Cutting one is expensive
-        // on real files - CAM output with adaptive feed emits an F word every
-        // few moves, which would deliver the program in batches of a handful of
-        // rows and make batch mode *slower* than the per-move protocol it
-        // replaces (measured on 500k moves: 0.59x with the flush, 1.85x
-        // without).
+        // It does not report progress. There is nothing an F word tells a
+        // progress bar, and reporting on every one is expensive on real
+        // files - CAM output with adaptive feed emits an F word every few
+        // moves.
         //
         // And it does not forward at all unless the rate moved - see
-        // MoveBatch::feed_rate for why the interpreter calls this so often.
+        // GCodeRenderer::feed_rate for why the interpreter calls this so
+        // often.
         //
-        // Neither affects arcs: ARC_FEED still flushes, and the arc path stages
-        // its segments at arc time with the rate current then, which is this
-        // one whether or not the callback that set it was suppressed.
-        if(!MoveBatch::feed_rate(rate)) return;
-        deliver_new_line(batch_line_number());
+        // Neither affects arcs: the renderer segments an arc with the rate
+        // current at the time, which is this one whether or not the callback
+        // that set it was suppressed.
+        if(!GCodeRenderer::feed_rate(rate)) return;
+        deliver_new_line(renderer_line_number());
     } else {
         maybe_new_line();
     }
@@ -786,10 +570,11 @@ void SET_FEED_RATE(double rate) {
 }
 
 void DWELL(double time) {
-    if(MoveBatch::active()) {
+    if(GCodeRenderer::active()) {
         if(interp_error) return;
-        // Appended, not flushed: a G81/G82 cycle emits one of these per hole.
-        MoveBatch::append(MoveBatch::Dwell, batch_line_number(),
+        // Rendered like any other event, and not a progress report of its
+        // own: a G81/G82 cycle emits one of these per hole.
+        GCodeRenderer::append(GCodeRenderer::Dwell, renderer_line_number(),
                      time, 0, 0, 0, 0, 0, 0, 0, 0);
         return;
     }
@@ -821,6 +606,7 @@ void COMMENT(const char *comment) {
     PyObject *result =
         callmethod(callback, "comment", "s", comment);
     if(result == NULL) interp_error ++;
+    else GCodeRenderer::comment(comment);
     Py_XDECREF(result);
 }
 
@@ -830,16 +616,16 @@ void SET_TOOL_TABLE_ENTRY(int /*pocket*/, int /*toolno*/, const EmcPose& /*offse
 
 void USE_TOOL_LENGTH_OFFSET(const EmcPose& offset) {
     tool_offset = offset;
-    if(MoveBatch::active()) {
+    if(GCodeRenderer::active()) {
         if(interp_error) return;
         if(metric) {
-            MoveBatch::append(MoveBatch::ToolOffset, batch_line_number(),
+            GCodeRenderer::append(GCodeRenderer::ToolOffset, renderer_line_number(),
                     offset.tran.x / 25.4, offset.tran.y / 25.4,
                     offset.tran.z / 25.4,
                     offset.a, offset.b, offset.c,
                     offset.u / 25.4, offset.v / 25.4, offset.w / 25.4);
         } else {
-            MoveBatch::append(MoveBatch::ToolOffset, batch_line_number(),
+            GCodeRenderer::append(GCodeRenderer::ToolOffset, renderer_line_number(),
                     offset.tran.x, offset.tran.y, offset.tran.z,
                     offset.a, offset.b, offset.c,
                     offset.u, offset.v, offset.w);
@@ -875,11 +661,8 @@ void START_SPINDLE_COUNTERCLOCKWISE(int /*spindle*/, int /*wait_for_at_speed*/) 
 void START_SPINDLE_CLOCKWISE(int /*spindle*/, int /*wait_for_at_speed*/) {}
 void SET_SPINDLE_MODE(int /*spindle*/, double) {}
 void STOP_SPINDLE_TURNING(int /*spindle*/, int /*wait_for_at_speed*/) {}
-// Forwards nothing - it never has - but the value is worth carrying: recording
-// it here costs one store and gives the batch rows a spindle-speed column the
-// per-move protocol never had, without adding a callback or a flush point.
 void SET_SPINDLE_SPEED(int spindle, double rpm) {
-    if(spindle == 0) MoveBatch::spindle_speed(rpm);
+    if(spindle == 0) GCodeRenderer::spindle_speed(rpm);
 }
 void ORIENT_SPINDLE(int /*spindle*/, double /*d*/, int /*i*/) {}
 void WAIT_SPINDLE_ORIENT_COMPLETE(int /*s*/, double /*timeout*/) {}
@@ -949,9 +732,10 @@ void STRAIGHT_PROBE(int line_number,
     _pos_a=a; _pos_b=b; _pos_c=c;
     _pos_u=u; _pos_v=v; _pos_w=w;
     if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    if(MoveBatch::active()) {
+    if(GCodeRenderer::active()) {
         if(interp_error) return;
-        MoveBatch::append(MoveBatch::Probe, line_number, x, y, z, a, b, c, u, v, w);
+        GCodeRenderer::append(GCodeRenderer::Probe, line_number,
+                              x, y, z, a, b, c, u, v, w);
         return;
     }
     maybe_new_line(line_number);
@@ -966,12 +750,12 @@ void STRAIGHT_PROBE(int line_number,
 void RIGID_TAP(int line_number,
                double x, double y, double z, double /*scale*/) {
     if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; }
-    if(MoveBatch::active()) {
+    if(GCodeRenderer::active()) {
         if(interp_error) return;
-        // a..w are zero, exactly the arguments the legacy `rigid_tap` callback
-        // did not have; the consumer joins x,y,z to the chain point's a..w as
-        // GLCanon.rigid_tap does.
-        MoveBatch::append(MoveBatch::RigidTap, line_number, x, y, z, 0, 0, 0, 0, 0, 0);
+        // a..w are zero, exactly the arguments the `rigid_tap` callback does
+        // not have; the renderer joins x,y,z to the chain point's a..w.
+        GCodeRenderer::append(GCodeRenderer::RigidTap, line_number,
+                              x, y, z, 0, 0, 0, 0, 0, 0);
         return;
     }
     maybe_new_line(line_number);
@@ -1045,8 +829,8 @@ int WAIT(int /*index*/, int /*input_type*/, int /*wait_type*/, double /*timeout*
 
 static void user_defined_function(int num, double arg1, double arg2) {
     if(interp_error) return;
-    if(MoveBatch::active()) {
-        MoveBatch::append(MoveBatch::M1xx, batch_line_number(),
+    if(GCodeRenderer::active()) {
+        GCodeRenderer::append(GCodeRenderer::M1xx, renderer_line_number(),
                      num, arg1, arg2, 0, 0, 0, 0, 0, 0);
         return;
     }
@@ -1218,10 +1002,13 @@ static PyObject *parse_file(PyObject * /*self*/, PyObject *args) {
     }
 
     // Protocol selection, once, before anything is interpreted: a mode that
-    // could flip mid-parse would leave the consumer's program half in each
-    // protocol, and a per-call attribute check would cost more than batching
-    // saves.
-    if(!MoveBatch::arm(callback)) return NULL;
+    // could flip mid-parse would leave the canon's program half in each
+    // protocol, and a per-call attribute check would cost more than the
+    // renderer saves.
+    // Before arming: a renderer reads its starting state off the canon, and a
+    // failed read has to be visible rather than cleared by the reset below.
+    interp_error = 0;
+    if(!GCodeRenderer::arm(callback)) return NULL;
     last_delivered_sequence_number = -1;
 
     if(pinterp) {
@@ -1239,7 +1026,6 @@ static PyObject *parse_file(PyObject * /*self*/, PyObject *args) {
     gettimeofday(&t0, NULL);
 
     metric=false;
-    interp_error = 0;
     last_sequence_number = -1;
 
     _pos_x = _pos_y = _pos_z = _pos_a = _pos_b = _pos_c = 0;
@@ -1280,12 +1066,13 @@ static PyObject *parse_file(PyObject * /*self*/, PyObject *args) {
         result = pinterp->read();
         gettimeofday(&t1, NULL);
         if(t1.tv_sec > t0.tv_sec + wait) {
-            // Bounds how stale a batch consumer's progress can get, and keeps
-            // check_abort() - which pumps AXIS's event loop - from running with
-            // a pending exception raised by the flush.
-            MoveBatch::flush();
+            // Bounds how stale a canon's progress report can get through a
+            // long run of moves on one line, and keeps check_abort() - which
+            // pumps AXIS's event loop - from running with a pending exception
+            // raised by the report.
+            GCodeRenderer::progress();
             if(interp_error) break;
-            if(check_abort()) return NULL;
+            if(check_abort()) { GCodeRenderer::finish(); return NULL; }
             t0 = t1;
         }
         if(!RESULT_OK) break;
@@ -1300,6 +1087,9 @@ out_error:
         pinterp->close();
     }
     if(interp_error) {
+        // Hand over what was rendered before the failure: a partial preview is
+        // what a partial program has always produced.
+        GCodeRenderer::finish();
         if(!PyErr_Occurred()) {
             PyErr_Format(PyExc_RuntimeError,
                     "interp_error > 0 but no Python exception set");
@@ -1315,6 +1105,7 @@ out_error:
     }
     PyErr_Clear();
     maybe_new_line();
+    GCodeRenderer::finish();
     if(PyErr_Occurred()) { interp_error = 1; goto out_error; }
     PyObject *retval = PyTuple_New(2);
     PyTuple_SetItem(retval, 0, PyLong_FromLong(result));
@@ -1429,24 +1220,11 @@ static bool get_attr(PyObject *o, const char *attr_name, const char *fmt, ...) {
     return result;
 }
 
-static void unrotate(double &x, double &y, double c, double s) {
-    double tx = x * c + y * s;
-    y = -x * s + y * c;
-    x = tx;
-}
-
-static void rotate(double &x, double &y, double c, double s) {
-    double tx = x * c - y * s;
-    y = x * s + y * c;
-    x = tx;
-}
-
 static PyObject *rs274_arc_to_segments(PyObject * /*self*/, PyObject *args) {
     PyObject *canon;
     double x1, y1, cx, cy, z1, a, b, c, u, v, w;
-    double o[9], n[9], g5xoffset[9], g92offset[9];
+    double o[9], g5xoffset[9], g92offset[9];
     int rot, plane;
-    int X, Y, Z;
     double rotation_cos, rotation_sin;
     int max_segments = 128;
 
@@ -1458,97 +1236,30 @@ static PyObject *rs274_arc_to_segments(PyObject * /*self*/, PyObject *args) {
     if(!get_attr(canon, "plane", &plane)) return NULL;
     if(!get_attr(canon, "rotation_cos", &rotation_cos)) return NULL;
     if(!get_attr(canon, "rotation_sin", &rotation_sin)) return NULL;
-    if(!get_attr(canon, "g5x_offset_x", &g5xoffset[0])) return NULL;
-    if(!get_attr(canon, "g5x_offset_y", &g5xoffset[1])) return NULL;
-    if(!get_attr(canon, "g5x_offset_z", &g5xoffset[2])) return NULL;
-    if(!get_attr(canon, "g5x_offset_a", &g5xoffset[3])) return NULL;
-    if(!get_attr(canon, "g5x_offset_b", &g5xoffset[4])) return NULL;
-    if(!get_attr(canon, "g5x_offset_c", &g5xoffset[5])) return NULL;
-    if(!get_attr(canon, "g5x_offset_u", &g5xoffset[6])) return NULL;
-    if(!get_attr(canon, "g5x_offset_v", &g5xoffset[7])) return NULL;
-    if(!get_attr(canon, "g5x_offset_w", &g5xoffset[8])) return NULL;
-    if(!get_attr(canon, "g92_offset_x", &g92offset[0])) return NULL;
-    if(!get_attr(canon, "g92_offset_y", &g92offset[1])) return NULL;
-    if(!get_attr(canon, "g92_offset_z", &g92offset[2])) return NULL;
-    if(!get_attr(canon, "g92_offset_a", &g92offset[3])) return NULL;
-    if(!get_attr(canon, "g92_offset_b", &g92offset[4])) return NULL;
-    if(!get_attr(canon, "g92_offset_c", &g92offset[5])) return NULL;
-    if(!get_attr(canon, "g92_offset_u", &g92offset[6])) return NULL;
-    if(!get_attr(canon, "g92_offset_v", &g92offset[7])) return NULL;
-    if(!get_attr(canon, "g92_offset_w", &g92offset[8])) return NULL;
-
-    if(plane == 1) {
-        X=0; Y=1; Z=2;
-    } else if(plane == 3) {
-        X=2; Y=0; Z=1;
-    } else {
-        X=1; Y=2; Z=0;
-    }
-    n[X] = x1;
-    n[Y] = y1;
-    n[Z] = z1;
-    n[3] = a;
-    n[4] = b;
-    n[5] = c;
-    n[6] = u;
-    n[7] = v;
-    n[8] = w;
-    for(int ax=0; ax<9; ax++) o[ax] -= g5xoffset[ax];
-    unrotate(o[0], o[1], rotation_cos, rotation_sin);
-    for(int ax=0; ax<9; ax++) o[ax] -= g92offset[ax];
-
-    double theta1 = atan2(o[Y]-cy, o[X]-cx);
-    double theta2 = atan2(n[Y]-cy, n[X]-cx);
-    /* Issue #1528 1/2/22 andypugh */
-    /*_posemath checks for small arcs too, but uses config units */
-    double len = hypot(o[X]-n[X], o[Y]-n[Y]) * (25.4 * GET_EXTERNAL_LENGTH_UNITS());
-    /* If the signs of the angles differ, make them the same to allow monotonic progress through the arc */
-    /* If start and end points are nearly identical, then interpret as a full turn */
-    if(rot < 0) { // CW G2
-        if (theta1 < theta2) theta2 -= 2*M_PI;
-        if (len < CART_FUZZ) theta2 -= 2*M_PI;
-    } else { // CCW G3
-        if (theta1 > theta2) theta2 += 2*M_PI;
-        if (len < CART_FUZZ) theta2 += 2*M_PI;
+    static const char *const G5X[9] = {"g5x_offset_x", "g5x_offset_y",
+        "g5x_offset_z", "g5x_offset_a", "g5x_offset_b", "g5x_offset_c",
+        "g5x_offset_u", "g5x_offset_v", "g5x_offset_w"};
+    static const char *const G92[9] = {"g92_offset_x", "g92_offset_y",
+        "g92_offset_z", "g92_offset_a", "g92_offset_b", "g92_offset_c",
+        "g92_offset_u", "g92_offset_v", "g92_offset_w"};
+    for(int i=0; i<9; i++) {
+        if(!get_attr(canon, G5X[i], &g5xoffset[i])) return NULL;
+        if(!get_attr(canon, G92[i], &g92offset[i])) return NULL;
     }
 
-    // if multi-turn, add the right number of full circles
-    if(rot < -1) theta2 += 2*M_PI*(rot+1);
-    if(rot > 1) theta2 += 2*M_PI*(rot-1);
-
-    int steps = std::max(3, int(max_segments * fabs(theta1 - theta2) / M_PI));
-    double rsteps = 1. / steps;
+    std::vector<double> pts;
+    int steps = arc_segments(o, plane, rotation_cos, rotation_sin,
+                             g5xoffset, g92offset,
+                             x1, y1, cx, cy, rot, z1, a, b, c, u, v, w,
+                             max_segments, pts);
     PyObject *segs = PyList_New(steps);
-
-    double dtheta = theta2 - theta1;
-    double d[9] = {0, 0, 0, n[3]-o[3], n[4]-o[4], n[5]-o[5], n[6]-o[6], n[7]-o[7], n[8]-o[8]};
-    d[Z] = n[Z] - o[Z];
-
-    double tx = o[X] - cx, ty = o[Y] - cy, dc = cos(dtheta*rsteps), ds = sin(dtheta*rsteps);
-    for(int i=0; i<steps-1; i++) {
-        double f = (i+1) * rsteps;
-        double p[9];
-        rotate(tx, ty, dc, ds);
-        p[X] = tx + cx;
-        p[Y] = ty + cy;
-        p[Z] = o[Z] + d[Z] * f;
-        p[3] = o[3] + d[3] * f;
-        p[4] = o[4] + d[4] * f;
-        p[5] = o[5] + d[5] * f;
-        p[6] = o[6] + d[6] * f;
-        p[7] = o[7] + d[7] * f;
-        p[8] = o[8] + d[8] * f;
-        for(int ax=0; ax<9; ax++) p[ax] += g92offset[ax];
-        rotate(p[0], p[1], rotation_cos, rotation_sin);
-        for(int ax=0; ax<9; ax++) p[ax] += g5xoffset[ax];
+    if(!segs) return NULL;
+    for(int i=0; i<steps; i++) {
+        const double *p = &pts[(size_t)i * 9];
         PyList_SET_ITEM(segs, i,
-            Py_BuildValue("ddddddddd", p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]));
+            Py_BuildValue("ddddddddd", p[0], p[1], p[2], p[3], p[4], p[5],
+                          p[6], p[7], p[8]));
     }
-    for(int ax=0; ax<9; ax++) n[ax] += g92offset[ax];
-    rotate(n[0], n[1], rotation_cos, rotation_sin);
-    for(int ax=0; ax<9; ax++) n[ax] += g5xoffset[ax];
-    PyList_SET_ITEM(segs, steps-1,
-        Py_BuildValue("ddddddddd", n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8]));
     return segs;
 }
 
@@ -1580,6 +1291,7 @@ PyMODINIT_FUNC PyInit_gcode(void)
 {
 
     PyObject *m = PyModule_Create(&gcode_moduledef);
+    if(!preview_geometry_ready()) return NULL;
     PyType_Ready(&LineCodeType);
     PyModule_AddObject(m, "linecode", (PyObject*)&LineCodeType);
     PyObject_SetAttrString(m, "MAX_ERROR", PyLong_FromLong(maxerror));

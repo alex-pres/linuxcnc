@@ -1,0 +1,18 @@
+(Exercises both dwell-marker colours: G4 uses colors['dwell'] and a)
+(user-defined M1xx call uses colors['m1xx'], so a bake of this program)
+(must collect exactly two palette entries and give each marker the index)
+(of its own colour. The two dwells either side of the M100 also pin that)
+(a colour recurring after another one reuses its original entry rather)
+(than taking a new one.)
+(Free of tool changes and tool-length offsets: the standalone gcode)
+(module has no tool table, so T/M6 and G43 cannot be parsed headlessly.)
+G20 G90 G94
+G0 X0 Y0 Z0.5
+G1 F20 Z0
+G1 X1 Y0
+G4 P0.1
+G1 X2 Y0
+M100 P1 Q2
+G1 X3 Y0
+G4 P0.2
+M2

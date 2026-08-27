@@ -1,0 +1,22 @@
+(alternating_dwells.ngc - one move, one dwell, one move, one dwell, ...)
+(The order the events happened in is the one fact only the canon knows: the)
+(dwell list has no positional relationship to the move lists, and neither)
+(list says what came between. It is the reason the fill lives in the canon)
+(rather than in the bake, so it needs a program where getting it wrong is)
+(visible - every dwell here sits between two different moves, so an)
+(off-by-one puts every marker on the wrong segment.)
+G20 G90 G94
+G0 X0 Y0 Z0
+G1 F20 X1 Y0
+G4 P0.01
+G1 X2 Y0
+M100 P1 Q2
+G1 X2 Y1
+G4 P0.01
+G1 X2 Y2
+M100 P3 Q4
+G1 X1 Y2
+G4 P0.01
+G1 X0 Y2
+G0 Z0.5
+M2

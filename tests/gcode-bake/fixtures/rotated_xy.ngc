@@ -1,0 +1,16 @@
+(rotated_xy.ngc - a constant G10 L2 XY rotation, set before any motion.)
+(rotate_and_translate applies the rotation per move as it is emitted, so)
+(every recorded point is already rotated. unrotate_preview undoes it with)
+(the final rotation, which for this program is also the only rotation - so)
+(this is the fixture where the retained C oracle and a per-move)
+(accumulation must agree exactly. Contrast rotate_midfile.ngc.)
+G20 G90 G94
+G10 L2 P1 X0.25 Y0.75 R30
+G54
+G0 X0 Y0 Z0
+G1 F20 X1 Y0
+G1 X1 Y1
+G1 X0 Y1
+G1 X0 Y0
+G0 Z0.5
+M2
