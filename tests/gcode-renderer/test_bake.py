@@ -3,13 +3,15 @@
 ``rs274.glcanon_bake`` turns an adopted :class:`ProgramGeometry` into the
 buffers the GL renderer draws - the trajectory, the dwell markers, the
 per-plane palettes, the Lambert-shaded tool solids. This checks those, on
-records built by hand (:mod:`fake_preview`) so a test can ask for a
+records built by hand (``canon.FakePreview``) so a test can ask for a
 *particular* four-vertex program or eleven dwells in eleven colours.
 
 The GEOMETRY-string transform those records' positions came from is no longer
 Python's: it is the C renderer's, and it is checked against
 ``line9_reference`` - the independent scalar transcription in this directory -
-on a real parse, in ``test_program_record.py``.
+on a real parse, in ``test_transform.py``.
+
+GL-free: needs numpy alone, and runs on a tree with no built extension.
 """
 
 import importlib.util
@@ -37,7 +39,7 @@ def _load_bake():
 
 bake = _load_bake()
 
-from fake_preview import FakePreview  # noqa: E402
+from canon import FakePreview  # noqa: E402
 
 
 class ToolSolids(unittest.TestCase):

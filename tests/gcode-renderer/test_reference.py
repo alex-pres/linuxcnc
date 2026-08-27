@@ -1,4 +1,4 @@
-"""Bake reference tests for the C vertex9 / line9 preview expansion.
+"""The independent reference for the C vertex9 / line9 preview expansion.
 
 Two layers:
 
@@ -7,11 +7,12 @@ Two layers:
    bit-for-bit (float equality) across a matrix of geometry strings and points.
    This anchors the reference to the shipping C behaviour.
 
-2. **Recorded vertex streams** - exact expected output of the reference across
-   the geometry strings called out by the change (XYZ, XYZABC, ``-``/``!``/
-   ``;``, lathe, foam), plus the rotary subdivision counts. The numpy geometry
-   bake (task 4.2) is validated against these same expectations, so any
-   divergence between bake and C surfaces as a test failure here or there.
+2. **Hand-computed vertex streams** - the reference's output across the
+   geometry strings the preview draws (XYZ, XYZABC, ``-``/``!``/``;``, lathe,
+   foam), plus the rotary subdivision counts, each one small enough to work
+   out on paper. The C renderer is compared against this same reference on a
+   real parse in ``test_transform.py``, so any divergence between the two
+   surfaces as a test failure here or there.
 
 The C-comparison layer is skipped automatically where ``linuxcnc`` cannot be
 imported (e.g. a checkout without the built extension), leaving layer 2 as a

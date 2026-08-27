@@ -32,7 +32,7 @@
 #    rather than two comments asking each other to agree.
 #
 #    This module contains NO OpenGL calls, so everything in it can be
-#    unit-tested headless (tests/gcode-bake/).
+#    unit-tested headless (tests/gcode-renderer/).
 #
 
 from __future__ import annotations

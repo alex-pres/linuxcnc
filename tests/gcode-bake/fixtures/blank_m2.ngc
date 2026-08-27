@@ -1,6 +1,0 @@
-(blank_m2.ngc - a program that emits no motion at all.)
-(calc_extents special-cases this: rather than passing the 9e99 sentinels)
-(on to the properties dialog and to screens that size their view distance)
-(from the extents, it reports all eight vectors as [0,0,0]. That rule has)
-(to survive the move to accumulated extents, so it needs a fixture.)
-M2
