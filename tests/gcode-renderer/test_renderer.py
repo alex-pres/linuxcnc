@@ -216,8 +216,10 @@ class MidFileTransforms(unittest.TestCase):
         under R40. The first two therefore stay on the axis-aligned points
         the program named, and only the last three turn."""
         canon = parse(programs.rotate_midfile())
-        self.assertEqual(canon.rotation_xy, 40, "the program must turn")
         drawn = dict((line, pos) for pos, line, _k in record(canon))
+        # Read off the drawing, not off the canon: a rendered parse tells the
+        # canon nothing about the rotation.
+        self.assertNotEqual(drawn[9], (2.0, 1.0, 0.0), "the program must turn")
         self.assertEqual(drawn[5], (1.0, 0.0, 0.0))
         self.assertEqual(drawn[6], (1.0, 1.0, 0.0))
         turn = math.radians(40)
@@ -235,18 +237,21 @@ class TransformOwnership(unittest.TestCase, RecordComparison):
 
     They used to be read back off the canon's ``g5x_offset_*`` /
     ``g92_offset_*`` / ``rotation_xy`` attributes once per change, which made
-    a canon able to steer the fill by writing to them. It is not any more:
-    the three callbacks are still delivered, in full and in order, but what
-    the canon does with them afterwards cannot move a single vertex.
+    a canon able to steer the fill by writing to them. The renderer takes its
+    own copy out of the same canon call instead, so what the canon holds
+    cannot move a single vertex - and, since nothing in the tree reads that
+    copy on a rendered parse, the three callbacks are no longer delivered at
+    all. The per-move callback protocol still receives every one.
     """
 
     PROGRAM = programs.moving_transform()
 
-    def test_a_canon_that_clobbers_the_attributes_draws_the_same_program(self):
-        class Clobbering(CountingCanon):
-            """Takes every call, then writes nonsense where it used to land."""
+    def test_a_canon_holding_nonsense_draws_the_same_program(self):
+        """The attributes the fill used to be steered by are never read."""
 
-            def _wreck(self):
+        class Wrecked(CountingCanon):
+            def __init__(self, *args, **kw):
+                super().__init__(*args, **kw)
                 for axis in "xyzabcuvw":
                     setattr(self, "g5x_offset_" + axis, 1e6)
                     setattr(self, "g92_offset_" + axis, -1e6)
@@ -254,50 +259,49 @@ class TransformOwnership(unittest.TestCase, RecordComparison):
                 self.rotation_cos = 0.0
                 self.rotation_sin = 0.0
 
-            def set_g5x_offset(self, *args):
-                super().set_g5x_offset(*args)
-                self._wreck()
-
-            def set_g92_offset(self, *args):
-                super().set_g92_offset(*args)
-                self._wreck()
-
-            def set_xy_rotation(self, theta):
-                super().set_xy_rotation(theta)
-                self._wreck()
-
         clean = parse(self.PROGRAM, cls=CountingCanon)
-        wrecked = parse(self.PROGRAM, cls=Clobbering)
-        # The clobber has to have happened, or this proves nothing at all.
+        wrecked = parse(self.PROGRAM, cls=Wrecked)
+        # Still nonsense afterwards: nothing was forwarded, so nothing wrote
+        # over it - which is also what makes the comparison below mean
+        # something.
         self.assertEqual(wrecked.g5x_offset_x, 1e6)
         self.assertEqual(wrecked.g92_offset_x, -1e6)
         self.assertEqual(wrecked.rotation_xy, 137.0)
         self.assertNotEqual(clean.g5x_offset_x, wrecked.g5x_offset_x)
         self.assertRecordsEqual(clean, wrecked)
 
-    def test_the_three_callbacks_are_still_delivered_in_full(self):
-        """What the canon may no longer steer, it must still be told."""
+    def test_the_three_callbacks_are_not_forwarded_at_all(self):
+        """Nothing reads the canon's copy, so it is not paid for.
+
+        The DROs that show the offsets and the rotation read the *status
+        channel*, not the canon, and the transform itself is baked into the
+        record. A canon that wants them reads the finished program.
+        """
         seen = []
 
         class Watching(CountingCanon):
-            def set_g5x_offset(self, *args):
-                seen.append(("g5x",) + args)
-                super().set_g5x_offset(*args)
-
-            def set_g92_offset(self, *args):
-                seen.append(("g92",) + args)
-                super().set_g92_offset(*args)
-
-            def set_xy_rotation(self, theta):
-                seen.append(("rot", theta))
-                super().set_xy_rotation(theta)
+            def set_g5x_offset(self, *a): seen.append("g5x")
+            def set_g92_offset(self, *a): seen.append("g92")
+            def set_xy_rotation(self, t): seen.append("rot")
+            def set_plane(self, p): seen.append("plane")
+            def set_traverse_rate(self, r): seen.append("traverse")
 
         parse(self.PROGRAM, cls=Watching)
-        kinds = [row[0] for row in seen]
-        self.assertIn("g5x", kinds)
-        self.assertIn("g92", kinds)
-        self.assertGreater(len({row[1] for row in seen if row[0] == "rot"}), 1,
-                           "the program must turn more than once")
+        self.assertEqual(seen, [])
+
+    def test_a_callback_canon_is_still_told_everything(self):
+        """The protocol this change does not touch."""
+        seen = []
+
+        class Watching(CallbackCanon):
+            def set_g5x_offset(self, *a): seen.append("g5x")
+            def set_g92_offset(self, *a): seen.append("g92")
+            def set_xy_rotation(self, t): seen.append("rot")
+
+        parse(self.PROGRAM, cls=Watching)
+        self.assertIn("g5x", seen)
+        self.assertIn("g92", seen)
+        self.assertIn("rot", seen)
 
 
 # -- events between the moves -----------------------------------------------
@@ -526,14 +530,15 @@ class CallbackCanon:
 
 
 class FeedRateForwarding(unittest.TestCase):
-    """An F word that changes nothing costs nothing in renderer mode.
+    """An F word costs nothing at all in renderer mode.
 
     ``interp_execute.cc`` calls ``SET_FEED_RATE`` for every block carrying an F
     word and never compares it to the rate already in force, so CAM output that
-    repeats one rate on every line - which is most of it - would otherwise be
-    one forwarded Python call per move in a protocol whose whole point is not
-    having those. A canon on the per-move *callback* protocol must keep
-    receiving every one of them.
+    repeats one rate on every line - which is most of it - is one call per
+    move, in a protocol whose whole point is not having those. The rate
+    already reaches the program through every move's own length table, so
+    nothing is forwarded. A canon on the per-move *callback* protocol must
+    keep receiving every one of them.
     """
 
     #: The same rate on every line, then a real change, then the same again.
@@ -555,25 +560,27 @@ class FeedRateForwarding(unittest.TestCase):
 
         return parse(text, cls=Counting), seen
 
-    def test_the_renderer_forwards_only_the_changes(self):
+    def test_the_renderer_forwards_none_of_them(self):
         _, rates = self.rates(CountingCanon, self.REPEATED)
-        # The trailing 0.0 is the interpreter resetting the rate at M2 - a real
-        # change, so it is forwarded like any other.
-        self.assertEqual(rates, [600.0, 900.0, 0.0])
+        self.assertEqual(rates, [])
 
     def test_a_callback_canon_still_sees_every_f_word(self):
         canon, rates = self.rates(CallbackCanon, self.REPEATED)
         self.assertEqual(rates, [600.0] * 10 + [900.0] * 10 + [0.0])
         self.assertEqual(canon.rates, rates, "the canon saw them too")
 
-    def test_the_first_f_word_is_always_forwarded(self):
-        """Even at 60.0, which is what the C-side tracker starts at.
+    def test_the_first_f_word_is_not_forwarded_either(self):
+        """Not even at 60.0, which is what the C-side tracker starts at.
 
-        Otherwise a consumer's own starting feed rate would be right only by
-        the coincidence of matching that initial value.
+        The rate still has to *reach the record* from the first move on, which
+        is what the length table below checks; what a canon holds in
+        ``self.feedrate`` is not read on a rendered parse.
         """
-        _, rates = self.rates(CountingCanon, "G20 G17 G90\nG1 F60 X1\nM2\n")
-        self.assertEqual(rates, [60.0, 0.0])
+        canon, rates = self.rates(CountingCanon,
+                                  "G20 G17 G90\nG1 F60 X1\nM2\n")
+        self.assertEqual(rates, [])
+        # 60 inches per minute is 1.0 inch per second, and the move is 1 inch.
+        self.assertEqual(canon.program_geometry._cut_length_by_feed, {1.0: 1.0})
 
     def test_the_suppressed_calls_do_not_cost_the_rate_itself(self):
         canon, _ = self.rates(CountingCanon, self.REPEATED)

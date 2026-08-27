@@ -182,7 +182,12 @@ class ExtentsWithATransform(unittest.TestCase):
         """
         canon = parse(programs.rotate_midfile())
         canon.calc_extents()
-        self.assertEqual(canon.rotation_xy, 40, "the program must turn")
+        # That the program turns is read off the two boxes, not off the
+        # canon: a rendered parse tells the canon nothing about the rotation.
+        # The turned corners reach out past x = -1, which the square the
+        # program actually asked for never does.
+        self.assertLess(canon.min_extents[0], canon.min_extents_zero_rxy[0],
+                        "the program must turn")
         for got, want in zip(canon.min_extents_zero_rxy, (0.0, 0.0, 0.0)):
             self.assertAlmostEqual(got, want, 9)
         for got, want in zip(canon.max_extents_zero_rxy, (2.0, 2.0, 0.5)):

@@ -193,17 +193,28 @@ int arc_segments(const Point9 &lo, int plane,
 //     vocabulary - `stop`, `notify`, the foam Z levels - is the canon's. The
 //     suppression depth those comments used to carry back is read here
 //     instead, out of the same text, after the canon has had it.
-//   * the g5x/g92 offsets, the XY rotation, the plane and the feed rate are
-//     still forwarded, so a canon that watches them still sees them - but as
-//     pure observations: the renderer keeps its own copy, taken from the same
-//     call, and never reads what Python did with it.
+//   * `message` is still forwarded: an `(MSG,...)` is addressed to the
+//     operator, not to the preview.
 //   * `change_tool` is still forwarded - not for the record, which is written
 //     here, but because the interpreter reads the canon's tool table for a G43
 //     after it, and a GUI's override is what moves the simulated spindle slot.
 //     The canon keeps no list of its own: `GLCanon.adopt_geometry` rebuilds
 //     `tool_list` out of the records at the end of the parse.
-//     `tool_offset` is *not* forwarded: it moved only geometry state the
-//     renderer now owns.
+//   * `next_line`, before each of the above, because `GLCanon.comment` reads
+//     `self.state.gcodes` for the foam Z levels and gremlin and qtvcp read it
+//     again after the parse for the program's units. It is delivered on the
+//     lines that still forward, which is a handful per parse rather than one
+//     per line.
+//
+// Everything else is dropped. The g5x/g92 offsets, the XY rotation, the plane
+// and the feed rate used to be forwarded as pure observations; nothing in the
+// tree reads the canon's copy of any of them on a rendered parse (the DROs
+// read the *status channel*, and the lengths and the transform are the
+// record's), and the feed rate alone was thousands of calls a file, because
+// the interpreter reports an F word whether or not it changed anything. A
+// canon that wants them can read the finished program instead.
+// `tool_offset` is likewise not forwarded: it moved only geometry state the
+// renderer now owns.
 //
 // Ordering falls out: a move is rendered where it happens, under exactly the
 // offsets, rotation, plane and suppression in force at that point, because
@@ -217,11 +228,11 @@ int arc_segments(const Point9 &lo, int plane,
 //
 // Progress is reported through the canon's optional `renderer_progress`: a
 // rendered move delivers no `next_line`, so that is what a GUI's progress bar
-// counts instead. It fires before each still-forwarded callback, before the
-// periodic check_abort(), and at end of parse - which bounds how stale a
-// progress bar can get without costing a Python call per move. SET_FEED_RATE
-// is the deliberate exception: an F word tells a progress bar nothing, and CAM
-// output with adaptive feed emits one every few moves (see feed_rate below).
+// counts instead. It fires before each still-forwarded callback and on
+// parse_file's 100ms tick, which is what actually paces it - a rendered parse
+// forwards so little that the tick is usually the only source. A report that
+// had nothing to report since the last one is dropped, so an idle stretch
+// costs nothing.
 //
 // Lifetime: the program's arrays are owned by the `gcode.PreviewGeometry` the
 // handover creates and are never handed out before the parse ends, so no reader
@@ -309,22 +320,10 @@ public:
     static void finish();
     static void note_plane(int plane);
 
-    // Record the rate the following moves are made at, and answer whether it
-    // actually moved. The interpreter reports an F word whether or not it
-    // changes anything - interp_execute.cc branches on `block->f_flag` alone,
-    // with no comparison against settings->feed_rate - so CAM output that
-    // repeats the same `F600` on every line calls in here once per move. In
-    // renderer mode there is nothing to say about a rate that did not change:
-    // the value already reached the program in every move's own length table.
-    // The first call of a parse always counts as a change, so a canon's own
-    // starting feed rate is set from the file even when the file opens with the
-    // same 60.0 this starts at.
-    static bool feed_rate(double rate) {
-        if(rate == rate_ && rate_seen_) return false;
-        rate_ = rate;
-        rate_seen_ = true;
-        return true;
-    }
+    // Record the rate the following moves are made at. One store: nothing is
+    // forwarded on an F word any more, so there is no call to suppress and
+    // nothing to compare against.
+    static void feed_rate(double rate) { rate_ = rate; }
 
     // Tracked whether or not a renderer is armed - one store, and there is no
     // callback to suppress, since SET_SPINDLE_SPEED has never forwarded one.
@@ -418,7 +417,6 @@ private:
     static inline GCodeRenderer *instance_ = nullptr;
     static inline PyObject *owner_ = nullptr;   // compared, never dereferenced
     static inline double rate_ = 60.0;
-    static inline bool rate_seen_ = false;
     static inline double speed_ = 0.0;
 };
 

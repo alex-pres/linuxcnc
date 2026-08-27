@@ -331,7 +331,6 @@ bool GCodeRenderer::read_planes() {
 bool GCodeRenderer::arm(PyObject *canon_ptr) {
     owner_ = nullptr;
     rate_ = 60.0;
-    rate_seen_ = false;
     speed_ = 0.0;
     delete instance_;
     instance_ = nullptr;

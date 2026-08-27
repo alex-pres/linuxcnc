@@ -40,11 +40,10 @@
   */
 
 
-#include <sys/time.h>
-
 #include <Python.h>
 #include <pybind11/pybind11.h>
 
+#include <chrono>
 #include <memory>
 
 #include "rs274ngc.hh"
@@ -145,10 +144,7 @@ static int renderer_line_number() {
     return pinterp ? pinterp->sequence_number() : last_sequence_number;
 }
 
-// Deliver next_line, without reporting progress. Split out for SET_FEED_RATE,
-// which is the one forwarder a progress bar has nothing to learn from - see
-// there. On the callback protocol this *is* maybe_new_line(), since the report
-// is a no-op.
+// Deliver next_line to the canon, at most once per source line.
 static void deliver_new_line(int sequence_number) {
     if(!pinterp) return;
     if(interp_error) return;
@@ -171,8 +167,9 @@ static void maybe_new_line(int sequence_number) {
     // Every canon function that forwards a Python callback calls
     // maybe_new_line() first, so this is where the renderer's progress report
     // lands: once per source line that produced anything, which is what a GUI
-    // counts now that a rendered move delivers no next_line. The one
-    // deliberate exception is SET_FEED_RATE - see there.
+    // counts now that a rendered move delivers no next_line. In renderer mode
+    // very little still forwards, so the periodic report in the parse loop is
+    // what actually bounds how stale a progress bar gets.
     GCodeRenderer::progress();
     deliver_new_line(sequence_number);
 }
@@ -357,40 +354,45 @@ void SET_G5X_OFFSET(int g5x_index,
                     double a, double b, double c,
                     double u, double v, double w) {
     if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
+    const Point9 offsets = {x, y, z, a, b, c, u, v, w};
+    // The renderer transforms with its own copy, taken here, and never reads
+    // the canon's - so in renderer mode there is nothing to tell the canon.
+    if(GCodeRenderer::active()) { GCodeRenderer::set_g5x(offsets); return; }
     maybe_new_line();
     forward("set_g5x_offset", g5x_index, x, y, z, a, b, c, u, v, w);
-    if(interp_error) return;
-    const Point9 offsets = {x, y, z, a, b, c, u, v, w};
-    GCodeRenderer::set_g5x(offsets);
 }
 
 void SET_G92_OFFSET(double x, double y, double z,
                     double a, double b, double c,
                     double u, double v, double w) {
     if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
+    const Point9 offsets = {x, y, z, a, b, c, u, v, w};
+    if(GCodeRenderer::active()) { GCodeRenderer::set_g92(offsets); return; }
     maybe_new_line();
     forward("set_g92_offset", x, y, z, a, b, c, u, v, w);
-    if(interp_error) return;
-    const Point9 offsets = {x, y, z, a, b, c, u, v, w};
-    GCodeRenderer::set_g92(offsets);
 }
 
 void SET_XY_ROTATION(double t) {
+    if(GCodeRenderer::active()) { GCodeRenderer::set_rotation_xy(t); return; }
     maybe_new_line();
     forward("set_xy_rotation", t);
-    if(interp_error) return;
-    GCodeRenderer::set_rotation_xy(t);
 };
 
 void USE_LENGTH_UNITS(CANON_UNITS u) { metric = u == CANON_UNITS_MM; }
 
 void SELECT_PLANE(CANON_PLANE pl) {
     GCodeRenderer::note_plane(static_cast<int>(pl));
+    // The plane reaches the record through note_plane and the arc segmenter;
+    // nothing on a rendered parse reads the canon's own copy.
+    if(GCodeRenderer::active()) return;
     maybe_new_line();
     forward("set_plane", static_cast<int>(pl));
 }
 
 void SET_TRAVERSE_RATE(double rate) {
+    // A traverse carries no rate into the record - rapid_length is a length,
+    // not a time - so a rendered parse has nothing to say about this.
+    if(GCodeRenderer::active()) return;
     maybe_new_line();
     forward("set_traverse_rate", rate);
 }
@@ -430,25 +432,18 @@ void RELOAD_TOOLDATA(void) {
 void SET_FEED_RATE(double rate) {
     if(metric) rate /= 25.4;
     if(GCodeRenderer::active()) {
-        // Two departures here, both because the renderer already has the rate.
+        // The rate reaches the program in every move's own length table, so
+        // there is nothing left for the canon to be told - and telling it is
+        // not cheap: the interpreter reports an F word whether or not it
+        // changed anything (interp_execute.cc branches on `block->f_flag`
+        // alone), so CAM output with adaptive feed lands here once per move.
         //
-        // It does not report progress. There is nothing an F word tells a
-        // progress bar, and reporting on every one is expensive on real
-        // files - CAM output with adaptive feed emits an F word every few
-        // moves.
-        //
-        // And it does not forward at all unless the rate moved - see
-        // GCodeRenderer::feed_rate for why the interpreter calls this so
-        // often.
-        //
-        // Neither affects arcs: the renderer segments an arc with the rate
-        // current at the time, which is this one whether or not the callback
-        // that set it was suppressed.
-        if(!GCodeRenderer::feed_rate(rate)) return;
-        deliver_new_line(renderer_line_number());
-    } else {
-        maybe_new_line();
+        // Arcs are unaffected: the renderer segments an arc with the rate
+        // current at the time, which is this one.
+        GCodeRenderer::feed_rate(rate);
+        return;
     }
+    maybe_new_line();
     forward("set_feed_rate", rate);
 }
 
@@ -782,7 +777,20 @@ static double exact_float(const char *func, py::handle p) {
     return PyFloat_AS_DOUBLE(p.ptr());
 }
 
+// The machine's unit scales. Both are constants for the whole parse, and both
+// are asked for repeatedly: arc_segments() wants the length units once per arc
+// for its small-arc test, which in renderer mode is once per arc *rendered* -
+// thousands of Python calls for a number that cannot move. On the callback
+// protocol they are left alone, because there the canon was going to be called
+// per event anyway and a canon may legitimately watch the traffic. Cached only
+// while a renderer is armed; parse_file drops both at the start of a parse.
+static double length_units_ = 0.0;
+static bool length_units_known = false;
+static double angle_units_ = 0.0;
+static bool angle_units_known = false;
+
 double GET_EXTERNAL_ANGLE_UNITS() {
+    if(angle_units_known) return angle_units_;
     double dresult = 1.0;
     canon_guard([&]{
         // Note the mismatch, kept: the method is `angular`, the message says
@@ -790,15 +798,24 @@ double GET_EXTERNAL_ANGLE_UNITS() {
         dresult = exact_float("get_external_angle_units",
                 py::handle(callback).attr("get_external_angular_units")());
     });
+    if(GCodeRenderer::active() && !interp_error) {
+        angle_units_ = dresult;
+        angle_units_known = true;
+    }
     return dresult;
 }
 
 double GET_EXTERNAL_LENGTH_UNITS() {
+    if(length_units_known) return length_units_;
     double dresult = 0.03937007874016;
     canon_guard([&]{
         dresult = exact_float("get_external_length_units",
                 py::handle(callback).attr("get_external_length_units")());
     });
+    if(GCodeRenderer::active() && !interp_error) {
+        length_units_ = dresult;
+        length_units_known = true;
+    }
     return dresult;
 }
 
@@ -842,8 +859,19 @@ static py::object parse_file(const char *f, py::handle canon,
                              const char *unitcode, const char *initcode,
                              const char *interpname) {
     int error_line_offset = 0;
-    struct timeval t0, t1;
-    int wait = 1;
+    // How often the parse stops to report progress and let the GUI breathe.
+    // A GUI's progress bar and its abort button both hang off this one tick -
+    // the report moves the bar, and check_abort() is what pumps the event
+    // loop the button is waiting in. It used to be one second, from when a
+    // preview was built one Python call per move and a big file took minutes;
+    // a rendered million-move file now parses in under a second, so the bar
+    // moved exactly once, at the end. 100ms reads as continuous, and what it
+    // gates is two Python calls - nothing beside a parse.
+    // steady_clock, not gettimeofday: a wall clock can step backwards under
+    // NTP and stall the tick for as long as the step.
+    using clock = std::chrono::steady_clock;
+    const auto tick = std::chrono::milliseconds(100);
+    clock::time_point last;
     int result = INTERP_OK;
 
     // Borrowed for the length of the parse, as it always has been: nothing
@@ -872,9 +900,11 @@ static py::object parse_file(const char *f, py::handle canon,
     for(int i=0; i<USER_DEFINED_FUNCTION_NUM; i++) 
         USER_DEFINED_FUNCTION[i] = user_defined_function;
 
-    gettimeofday(&t0, NULL);
+    last = clock::now();
 
     metric=false;
+    length_units_known = false;
+    angle_units_known = false;
     last_sequence_number = -1;
 
     _pos_x = _pos_y = _pos_z = _pos_a = _pos_b = _pos_c = 0;
@@ -913,8 +943,8 @@ static py::object parse_file(const char *f, py::handle canon,
     while(!interp_error && RESULT_OK) {
         error_line_offset = 1;
         result = pinterp->read();
-        gettimeofday(&t1, NULL);
-        if(t1.tv_sec > t0.tv_sec + wait) {
+        clock::time_point now = clock::now();
+        if(now - last >= tick) {
             // Bounds how stale a canon's progress report can get through a
             // long run of moves on one line, and keeps check_abort() - which
             // pumps AXIS's event loop - from running with a pending exception
@@ -925,7 +955,7 @@ static py::object parse_file(const char *f, py::handle canon,
                 GCodeRenderer::finish();
                 throw py::error_already_set();
             }
-            t0 = t1;
+            last = now;
         }
         if(!RESULT_OK) break;
         error_line_offset = 0;
