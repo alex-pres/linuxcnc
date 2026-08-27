@@ -30,6 +30,8 @@
 
 #include "gcode_renderer.hh"
 
+namespace py = pybind11;
+
 void GCodeRenderer::progress() {
     if(!active()) return;
     // Never call into Python with an exception pending: the canon would be
@@ -53,14 +55,14 @@ void GCodeRenderer::comment(const char *text) {
 // the moment its callback forwards - so there is nothing to read back off the
 // canon and nothing that can go stale between the call and the move it
 // applies to.
-void GCodeRenderer::set_g5x(const double offsets[9]) {
+void GCodeRenderer::set_g5x(const Point9 &offsets) {
     if(!active() || interp_error || !owned()) return;
-    memcpy(instance_->g5x_, offsets, sizeof instance_->g5x_);
+    instance_->g5x_ = offsets;
 }
 
-void GCodeRenderer::set_g92(const double offsets[9]) {
+void GCodeRenderer::set_g92(const Point9 &offsets) {
     if(!active() || interp_error || !owned()) return;
-    memcpy(instance_->g92_, offsets, sizeof instance_->g92_);
+    instance_->g92_ = offsets;
 }
 
 void GCodeRenderer::set_rotation_xy(double degrees) {
@@ -97,17 +99,6 @@ void GCodeRenderer::arc(int line_number, double first_end, double second_end,
 // ---------------------------------------------------------------------------
 // One parse's renderer
 // ---------------------------------------------------------------------------
-
-// Read one float attribute. False with an exception set, as the caller stops.
-static bool get_double(PyObject *o, const char *name, double *out) {
-    PyObject *v = PyObject_GetAttrString(o, name);
-    if(!v) return false;
-    double d = PyFloat_AsDouble(v);
-    Py_DECREF(v);
-    if(d == -1.0 && PyErr_Occurred()) return false;
-    *out = d;
-    return true;
-}
 
 static const char AXES[9] = {'x','y','z','a','b','c','u','v','w'};
 
@@ -163,323 +154,181 @@ void PreviewData::shrink() {
     cap = want;
 }
 
-typedef struct {
-    PyObject_HEAD
-    PreviewData *data;
-} PreviewGeometry;
-
 // A read-only buffer over part of a PreviewGeometry, keeping it alive. What
 // numpy wraps, so the program reaches Python without a copy.
-typedef struct {
-    PyObject_HEAD
-    PyObject *owner;
+struct __attribute__((visibility("hidden"))) ArrayView {
+    py::object owner;                   // the PreviewGeometry the memory is in
     void *ptr;
-    Py_ssize_t nbytes, itemsize;
+    Py_ssize_t nitems, itemsize;
     const char *format;
-} ArrayView;
-
-static void ArrayView_dealloc(ArrayView *self) {
-    Py_XDECREF(self->owner);
-    Py_TYPE(self)->tp_free((PyObject*)self);
-}
-
-static int ArrayView_getbuffer(ArrayView *self, Py_buffer *view, int flags) {
-    int bad = PyBuffer_FillInfo(view, (PyObject*)self, self->ptr,
-                                self->nbytes, 1, flags);
-    if(bad) return bad;
-    view->itemsize = self->itemsize;
-    view->format = (flags & PyBUF_FORMAT) ? (char*)self->format : nullptr;
-    return 0;
-}
-
-static PyBufferProcs ArrayView_as_buffer = {
-    (getbufferproc)ArrayView_getbuffer,
-    nullptr,
 };
 
-// Both types are filled in by preview_geometry_ready(): a designated
-// initializer cannot follow PyVarObject_HEAD_INIT in C++. The remaining
-// fields are value-initialized to zero, which is what a static PyTypeObject
-// wants; -Wmissing-field-initializers has nothing real to say about it.
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
-static PyTypeObject ArrayViewType = { PyVarObject_HEAD_INIT(nullptr, 0) };
-#pragma GCC diagnostic pop
-
-static PyObject *array_view(PyObject *owner, void *ptr, Py_ssize_t nbytes,
-                            Py_ssize_t itemsize, const char *format) {
-    ArrayView *v = PyObject_New(ArrayView, &ArrayViewType);
-    if(!v) return nullptr;
-    Py_INCREF(owner);
-    v->owner = owner;
-    v->ptr = ptr;
-    v->nbytes = nbytes;
-    v->itemsize = itemsize;
-    v->format = format;
-    return (PyObject*)v;
+static py::object array_view(py::object owner, void *ptr, Py_ssize_t nitems,
+                             Py_ssize_t itemsize, const char *format) {
+    return py::cast(ArrayView{std::move(owner), ptr, nitems, itemsize, format});
 }
 
-static void PreviewGeometry_dealloc(PreviewGeometry *self) {
-    delete self->data;
-    Py_TYPE(self)->tp_free((PyObject*)self);
+static py::tuple triple(const double *v) {
+    return py::make_tuple(v[0], v[1], v[2]);
 }
 
-static PyObject *pg_positions(PreviewGeometry *self, PyObject *args) {
-    int plane = 0;
-    if(!PyArg_ParseTuple(args, "|i:positions", &plane)) return nullptr;
-    if(plane < 0 || plane >= self->data->nplanes) {
-        PyErr_SetString(PyExc_IndexError, "no such drawn plane");
-        return nullptr;
-    }
-    return array_view((PyObject*)self, self->data->pos[plane],
-                      (Py_ssize_t)self->data->n * 3 * sizeof(float),
-                      sizeof(float), "f");
-}
-
-static PyObject *pg_attrs(PreviewGeometry *self, PyObject *) {
-    return array_view((PyObject*)self, self->data->attrs,
-                      (Py_ssize_t)self->data->n * 2 * sizeof(uint32_t),
-                      sizeof(uint32_t), "I");
-}
-
-static PyObject *triple(const double *v) {
-    return Py_BuildValue("ddd", v[0], v[1], v[2]);
-}
-
-static PyObject *pg_extents(PreviewGeometry *self, PyObject *) {
-    PyObject *out = PyTuple_New(4);
-    if(!out) return nullptr;
-    for(int i = 0; i < 4; i++)
-        PyTuple_SET_ITEM(out, i, Py_BuildValue("NN",
-                    triple(self->data->extents[i][0]),
-                    triple(self->data->extents[i][1])));
+static py::tuple points_tuple(const double pts[2][3], int nplanes) {
+    py::tuple out(nplanes);
+    for(int i = 0; i < nplanes; i++) out[i] = triple(pts[i]);
     return out;
 }
 
-static PyObject *pg_drawn_extents(PreviewGeometry *self, PyObject *) {
-    return Py_BuildValue("NN", triple(self->data->drawn[0]),
-                         triple(self->data->drawn[1]));
+py::object preview_geometry_new(PreviewData *data) {
+    // The holder takes the program; nothing else may free it after this.
+    return py::cast(std::unique_ptr<PreviewData>(data));
 }
 
-static PyObject *pg_cut_lengths(PreviewGeometry *self, PyObject *) {
-    PyObject *out = PyDict_New();
-    if(!out) return nullptr;
-    for(auto &entry : self->data->cut_length) {
-        PyObject *k = PyFloat_FromDouble(entry.first);
-        PyObject *v = PyFloat_FromDouble(entry.second);
-        if(!k || !v || PyDict_SetItem(out, k, v) < 0) {
-            Py_XDECREF(k); Py_XDECREF(v); Py_DECREF(out);
-            return nullptr;
-        }
-        Py_DECREF(k); Py_DECREF(v);
-    }
-    return out;
-}
+void preview_geometry_register(py::module_ &m) {
+    py::class_<ArrayView>(m, "arrayview", py::buffer_protocol(),
+            "Read-only view of a PreviewGeometry array")
+        .def_buffer([](ArrayView &v) {
+            return py::buffer_info(v.ptr, v.itemsize, v.format, 1,
+                                   {v.nitems}, {v.itemsize}, /*readonly=*/true);
+        });
 
-static PyObject *pg_tool_numbers(PreviewGeometry *self, PyObject *) {
-    size_t n = self->data->tool_numbers.size();
-    PyObject *out = PyList_New(n);
-    if(!out) return nullptr;
-    // Ordinal 0 is the state before any tool change: not stated, not T0.
-    Py_INCREF(Py_None);
-    PyList_SET_ITEM(out, 0, Py_None);
-    for(size_t i = 1; i < n; i++)
-        PyList_SET_ITEM(out, i, PyLong_FromLong(self->data->tool_numbers[i]));
-    return out;
-}
-
-static PyObject *points_tuple(const double pts[2][3], int nplanes) {
-    PyObject *out = PyTuple_New(nplanes);
-    if(!out) return nullptr;
-    for(int i = 0; i < nplanes; i++) PyTuple_SET_ITEM(out, i, triple(pts[i]));
-    return out;
-}
-
-static PyObject *pg_dwells(PreviewGeometry *self, PyObject *) {
-    PyObject *out = PyList_New(self->data->dwells.size());
-    if(!out) return nullptr;
-    Py_ssize_t at = 0;
-    for(const DwellRecord &d : self->data->dwells) {
-        PyObject *row = Py_BuildValue("iiONN", d.lineno, d.plane,
-                d.m1xx ? Py_True : Py_False, triple(d.raw),
-                points_tuple(d.pts, self->data->nplanes));
-        if(!row) { Py_DECREF(out); return nullptr; }
-        PyList_SET_ITEM(out, at ++, row);
-    }
-    return out;
-}
-
-static PyObject *pg_toolchanges(PreviewGeometry *self, PyObject *) {
-    PyObject *out = PyList_New(self->data->toolchanges.size());
-    if(!out) return nullptr;
-    Py_ssize_t at = 0;
-    for(const ToolChangeRecord &c : self->data->toolchanges) {
-        PyObject *row = Py_BuildValue("iiN", c.lineno, c.tool,
-                points_tuple(c.pts, self->data->nplanes));
-        if(!row) { Py_DECREF(out); return nullptr; }
-        PyList_SET_ITEM(out, at ++, row);
-    }
-    return out;
-}
-
-static PyMethodDef PreviewGeometry_methods[] = {
-    {"positions", (PyCFunction)pg_positions, METH_VARARGS,
-        "Read-only float32 xyz view of one drawn plane"},
-    {"attrs", (PyCFunction)pg_attrs, METH_NOARGS,
-        "Read-only uint32 (line, kind|tool) view"},
-    {"extents", (PyCFunction)pg_extents, METH_NOARGS,
-        "The four machine-frame (min, max) pairs"},
-    {"drawn_extents", (PyCFunction)pg_drawn_extents, METH_NOARGS,
-        "(min, max) over the transformed points in the array"},
-    {"cut_lengths", (PyCFunction)pg_cut_lengths, METH_NOARGS,
-        "{commanded rate: cutting length at it}"},
-    {"tool_numbers", (PyCFunction)pg_tool_numbers, METH_NOARGS,
-        "Ordinal -> T number, entry 0 None"},
-    {"dwells", (PyCFunction)pg_dwells, METH_NOARGS,
-        "(lineno, plane, is_m1xx, raw xyz, points per plane) per dwell"},
-    {"toolchanges", (PyCFunction)pg_toolchanges, METH_NOARGS,
-        "(lineno, tool number, points per plane) per tool change"},
-    {},
-};
-
-static PyObject *pg_get_n(PreviewGeometry *self, void *) {
-    return PyLong_FromSize_t(self->data->n);
-}
-static PyObject *pg_get_moves(PreviewGeometry *self, void *) {
-    return PyLong_FromSize_t(self->data->moves);
-}
-static PyObject *pg_get_planes(PreviewGeometry *self, void *) {
-    return PyLong_FromLong(self->data->nplanes);
-}
-static PyObject *pg_get_rapid(PreviewGeometry *self, void *) {
-    return PyFloat_FromDouble(self->data->rapid_length);
-}
-static PyObject *pg_get_dwell_time(PreviewGeometry *self, void *) {
-    return PyFloat_FromDouble(self->data->dwell_time);
-}
-
-static PyGetSetDef PreviewGeometry_getset[] = {
-    {(char*)"n_vertices", (getter)pg_get_n, nullptr, nullptr, nullptr},
-    {(char*)"n_moves", (getter)pg_get_moves, nullptr, nullptr, nullptr},
-    {(char*)"n_planes", (getter)pg_get_planes, nullptr, nullptr, nullptr},
-    {(char*)"rapid_length", (getter)pg_get_rapid, nullptr, nullptr, nullptr},
-    {(char*)"dwell_time", (getter)pg_get_dwell_time, nullptr, nullptr, nullptr},
-    {},
-};
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
-static PyTypeObject PreviewGeometryType = { PyVarObject_HEAD_INIT(nullptr, 0) };
-#pragma GCC diagnostic pop
-
-bool preview_geometry_ready() {
-    ArrayViewType.tp_name = "gcode.arrayview";
-    ArrayViewType.tp_basicsize = sizeof(ArrayView);
-    ArrayViewType.tp_dealloc = (destructor)ArrayView_dealloc;
-    ArrayViewType.tp_as_buffer = &ArrayView_as_buffer;
-    ArrayViewType.tp_flags = Py_TPFLAGS_DEFAULT;
-    ArrayViewType.tp_doc = "Read-only view of a PreviewGeometry array";
-
-    PreviewGeometryType.tp_name = "gcode.PreviewGeometry";
-    PreviewGeometryType.tp_basicsize = sizeof(PreviewGeometry);
-    PreviewGeometryType.tp_dealloc = (destructor)PreviewGeometry_dealloc;
-    PreviewGeometryType.tp_flags = Py_TPFLAGS_DEFAULT;
-    PreviewGeometryType.tp_doc =
-        "A parsed program: vertex arrays, extents, lengths and records";
-    PreviewGeometryType.tp_methods = PreviewGeometry_methods;
-    PreviewGeometryType.tp_getset = PreviewGeometry_getset;
-
-    return PyType_Ready(&PreviewGeometryType) >= 0
-        && PyType_Ready(&ArrayViewType) >= 0;
-}
-
-PyObject *preview_geometry_new(PreviewData *data) {
-    PreviewGeometry *pg = PyObject_New(PreviewGeometry, &PreviewGeometryType);
-    if(!pg) { delete data; return nullptr; }
-    pg->data = data;
-    return (PyObject*)pg;
+    py::class_<PreviewData>(m, "PreviewGeometry",
+            "A parsed program: vertex arrays, extents, lengths and records")
+        // `self` rather than `PreviewData&`: the view must hold the object
+        // that owns the memory, not just a reference into it.
+        .def("positions", [](py::object self, int plane) {
+                PreviewData &d = py::cast<PreviewData&>(self);
+                if(plane < 0 || plane >= d.nplanes)
+                    throw py::index_error("no such drawn plane");
+                return array_view(std::move(self), d.pos[plane],
+                                  (Py_ssize_t)d.n * 3, sizeof(float), "f");
+            }, py::arg("plane") = 0,
+            "Read-only float32 xyz view of one drawn plane")
+        .def("attrs", [](py::object self) {
+                PreviewData &d = py::cast<PreviewData&>(self);
+                return array_view(std::move(self), d.attrs,
+                                  (Py_ssize_t)d.n * 2, sizeof(uint32_t), "I");
+            }, "Read-only uint32 (line, kind|tool) view")
+        .def("extents", [](const PreviewData &d) {
+                py::tuple out(4);
+                for(int i = 0; i < 4; i++)
+                    out[i] = py::make_tuple(triple(d.extents[i][0]),
+                                            triple(d.extents[i][1]));
+                return out;
+            }, "The four machine-frame (min, max) pairs")
+        .def("drawn_extents", [](const PreviewData &d) {
+                return py::make_tuple(triple(d.drawn[0]), triple(d.drawn[1]));
+            }, "(min, max) over the transformed points in the array")
+        .def("cut_lengths", [](const PreviewData &d) {
+                py::dict out;
+                for(const auto &entry : d.cut_length)
+                    out[py::float_(entry.first)] = entry.second;
+                return out;
+            }, "{commanded rate: cutting length at it}")
+        .def("tool_numbers", [](const PreviewData &d) {
+                size_t n = d.tool_numbers.size();
+                py::list out(n);
+                // Ordinal 0 is the state before any tool change: not stated,
+                // not T0.
+                out[0] = py::none();
+                for(size_t i = 1; i < n; i++) out[i] = d.tool_numbers[i];
+                return out;
+            }, "Ordinal -> T number, entry 0 None")
+        .def("dwells", [](const PreviewData &d) {
+                py::list out;
+                for(const DwellRecord &r : d.dwells)
+                    out.append(py::make_tuple(r.lineno, r.plane,
+                            py::bool_(r.m1xx), triple(r.raw),
+                            points_tuple(r.pts, d.nplanes)));
+                return out;
+            }, "(lineno, plane, is_m1xx, raw xyz, points per plane) per dwell")
+        .def("toolchanges", [](const PreviewData &d) {
+                py::list out;
+                for(const ToolChangeRecord &r : d.toolchanges)
+                    out.append(py::make_tuple(r.lineno, r.tool,
+                            points_tuple(r.pts, d.nplanes)));
+                return out;
+            }, "(lineno, tool number, points per plane) per tool change")
+        .def_property_readonly("n_vertices", [](const PreviewData &d) { return d.n; })
+        .def_property_readonly("n_moves", [](const PreviewData &d) { return d.moves; })
+        .def_property_readonly("n_planes", [](const PreviewData &d) { return d.nplanes; })
+        .def_property_readonly("rapid_length", [](const PreviewData &d) { return d.rapid_length; })
+        .def_property_readonly("dwell_time", [](const PreviewData &d) { return d.dwell_time; });
 }
 
 // Compile one GEOMETRY string into the steps transform_points walks, and read
 // the rotation offsets beside it. Both come from the canon's ProgramGeometry,
 // which is where the widget put them just before the parse.
 bool GCodeRenderer::read_planes() {
-    PyObject *pg = PyObject_GetAttrString(canon_, "program_geometry");
-    if(!pg) return false;
-    PyObject *planes = PyObject_GetAttrString(pg, "planes");
-    PyObject *ro = PyObject_GetAttrString(pg, "ro");
-    Py_DECREF(pg);
-    if(!planes || !ro) { Py_XDECREF(planes); Py_XDECREF(ro); return false; }
+    // Every read below raises rather than reporting; one catch turns the lot
+    // into the false-with-an-exception-set that the caller expects.
+    try {
+        py::object pg = canon_.attr("program_geometry");
+        py::object planes = pg.attr("planes");
+        py::object ro = pg.attr("ro");
 
-    double rox = 0, roy = 0, roz = 0;
-    long mask = 0;
-    PyObject *respect = PyObject_GetAttrString(ro, "respect_offsets");
-    PyObject *m = PyObject_GetAttrString(ro, "axis_mask");
-    if(!respect || !m
-    || !get_double(ro, "x", &rox) || !get_double(ro, "y", &roy)
-    || !get_double(ro, "z", &roz)) {
-        Py_XDECREF(respect); Py_XDECREF(m);
-        Py_DECREF(planes); Py_DECREF(ro);
-        return false;
-    }
-    respect_offsets_ = PyObject_IsTrue(respect);
-    mask = PyLong_AsLong(m);
-    Py_DECREF(respect); Py_DECREF(m); Py_DECREF(ro);
-    data_->respect_offsets = respect_offsets_;
+        double rox = ro.attr("x").cast<double>();
+        double roy = ro.attr("y").cast<double>();
+        double roz = ro.attr("z").cast<double>();
+        long mask = ro.attr("axis_mask").cast<long>();
+        respect_offsets_ = PyObject_IsTrue(ro.attr("respect_offsets").ptr());
+        data_->respect_offsets = respect_offsets_;
 
-    Py_ssize_t n = PySequence_Size(planes);
-    if(n < 1 || n > 2) {
-        Py_DECREF(planes);
-        PyErr_SetString(PyExc_ValueError,
-                "parse: the renderer draws one or two planes");
-        return false;
-    }
-    data_->nplanes = (int)n;
-    for(Py_ssize_t i = 0; i < n; i++) {
-        PyObject *s = PySequence_GetItem(planes, i);
-        const char *geom = s ? PyUnicode_AsUTF8(s) : nullptr;
-        if(!geom) { Py_XDECREF(s); Py_DECREF(planes); return false; }
-        double sign = 1.0;
-        for(const char *ch = geom; *ch; ch++) {
-            GeomOp op = {};
-            op.sign = sign;
-            switch(*ch) {
-            case '-': sign = -1.0; continue;
-            case 'X': op.col = 0; op.a = 0; break;
-            case 'Y': op.col = 1; op.a = 1; break;
-            case 'Z': op.col = 2; op.a = 2; break;
-            case 'U': op.col = 6; op.a = 0; break;
-            case 'V': op.col = 7; op.a = 1; break;
-            case 'W': op.col = 8; op.a = 2; break;
-            case 'A': case 'B': case 'C': {
-                // A rotary letter turns a component pair - but only when the
-                // config asked for it, which is what the mask says.
-                int bit = *ch == 'A' ? 0x08 : *ch == 'B' ? 0x10 : 0x20;
-                sign = 1.0;
-                if(!(mask & bit)) continue;
-                op.rotate = true;
-                if(*ch == 'A') {
-                    op.col = 3; op.a = 1; op.b = 2; op.offa = roy; op.offb = roz;
-                } else if(*ch == 'B') {
-                    op.col = 4; op.a = 0; op.b = 2; op.offa = rox; op.offb = roz;
-                } else {
-                    op.col = 5; op.a = 0; op.b = 1; op.offa = rox; op.offb = roy;
-                }
-                data_->ops[i].push_back(op);
-                continue;
-            }
-            default: continue;          // '!', ';' and friends, sign preserved
-            }
-            sign = 1.0;
-            data_->ops[i].push_back(op);
+        py::sequence names = planes.cast<py::sequence>();
+        size_t n = py::len(names);
+        if(n < 1 || n > 2) {
+            PyErr_SetString(PyExc_ValueError,
+                    "parse: the renderer draws one or two planes");
+            throw py::error_already_set();
         }
-        Py_DECREF(s);
+        data_->nplanes = (int)n;
+        for(size_t i = 0; i < n; i++) {
+            std::string geom = names[i].cast<std::string>();
+            double sign = 1.0;
+            for(const char *ch = geom.c_str(); *ch; ch++) {
+                GeomOp op = {};
+                op.sign = sign;
+                switch(*ch) {
+                case '-': sign = -1.0; continue;
+                case 'X': op.col = 0; op.a = 0; break;
+                case 'Y': op.col = 1; op.a = 1; break;
+                case 'Z': op.col = 2; op.a = 2; break;
+                case 'U': op.col = 6; op.a = 0; break;
+                case 'V': op.col = 7; op.a = 1; break;
+                case 'W': op.col = 8; op.a = 2; break;
+                case 'A': case 'B': case 'C': {
+                    // A rotary letter turns a component pair - but only when
+                    // the config asked for it, which is what the mask says.
+                    int bit = *ch == 'A' ? 0x08 : *ch == 'B' ? 0x10 : 0x20;
+                    sign = 1.0;
+                    if(!(mask & bit)) continue;
+                    op.rotate = true;
+                    if(*ch == 'A') {
+                        op.col = 3; op.a = 1; op.b = 2;
+                        op.offa = roy; op.offb = roz;
+                    } else if(*ch == 'B') {
+                        op.col = 4; op.a = 0; op.b = 2;
+                        op.offa = rox; op.offb = roz;
+                    } else {
+                        op.col = 5; op.a = 0; op.b = 1;
+                        op.offa = rox; op.offb = roy;
+                    }
+                    data_->ops[i].push_back(op);
+                    continue;
+                }
+                default: continue;      // '!', ';' and friends, sign preserved
+                }
+                sign = 1.0;
+                data_->ops[i].push_back(op);
+            }
+        }
+    } catch(py::error_already_set &e) {
+        e.restore();
+        return false;
     }
-    Py_DECREF(planes);
     return true;
 }
 
-bool GCodeRenderer::arm(PyObject *canon) {
+bool GCodeRenderer::arm(PyObject *canon_ptr) {
     owner_ = nullptr;
     rate_ = 60.0;
     rate_seen_ = false;
@@ -487,25 +336,28 @@ bool GCodeRenderer::arm(PyObject *canon) {
     delete instance_;
     instance_ = nullptr;
 
-    PyObject *flag = PyObject_GetAttrString(canon, "use_gcode_renderer");
-    if(!flag) {
-        if(!PyErr_ExceptionMatches(PyExc_AttributeError)) return false;
-        PyErr_Clear();              // no attribute: the callback protocol
-        return true;
+    py::handle canon(canon_ptr);
+    py::object flag;
+    try {
+        flag = canon.attr("use_gcode_renderer");
+    } catch(py::error_already_set &e) {
+        if(!e.matches(PyExc_AttributeError)) { e.restore(); return false; }
+        return true;                    // no attribute: the callback protocol
     }
     // Anything that is not a bool is not an opt-in - see the note on
     // catch-all `__getattr__` in the header. Callback protocol, no complaint:
     // a canon that never mentions the flag must not be made to fail.
-    bool opted_in = PyBool_Check(flag) && flag == Py_True;
-    Py_DECREF(flag);
-    if(!opted_in) return true;
+    if(!PyBool_Check(flag.ptr()) || flag.ptr() != Py_True) return true;
 
     // Fail fast rather than fall back: a canon that asked for a preview and
     // silently got per-move callbacks would look like it worked and quietly
     // build nothing at all.
-    PyObject *consumer = PyObject_GetAttrString(canon, "adopt_geometry");
-    bool usable = consumer && PyCallable_Check(consumer);
-    Py_XDECREF(consumer);
+    bool usable = false;
+    try {
+        usable = PyCallable_Check(canon.attr("adopt_geometry").ptr());
+    } catch(py::error_already_set &) {
+        // Absent counts as unusable; the message below is the whole report.
+    }
     if(!usable) {
         PyErr_Clear();
         PyErr_SetString(PyExc_TypeError,
@@ -530,11 +382,10 @@ bool GCodeRenderer::arm(PyObject *canon) {
         delete r;
         return false;
     }
-    r->progress_ = PyObject_GetAttrString(canon, "renderer_progress");
-    if(r->progress_ && !PyCallable_Check(r->progress_)) {
-        Py_CLEAR(r->progress_);
-    }
-    PyErr_Clear();                      // a canon without one wants no progress
+    // getattr-with-default swallows whatever the read raised, which is what a
+    // canon that simply has no progress hook needs.
+    r->progress_ = py::getattr(canon, "renderer_progress", py::none());
+    if(!PyCallable_Check(r->progress_.ptr())) r->progress_ = py::object();
 
     // The chain point and the leading-traverse flag are the canon's own, not
     // assumed: a canon may be handed to a second parse mid-program. The
@@ -542,30 +393,33 @@ bool GCodeRenderer::arm(PyObject *canon) {
     // the offsets and the rotation from the parameter file during init(),
     // which runs after this.
     r->sync_in();
-    PyObject *div = PyObject_GetAttrString(canon, "arcdivision");
-    if(div) {
-        long n = PyLong_AsLong(div);
-        Py_DECREF(div);
+    py::object div = py::getattr(canon, "arcdivision", py::none());
+    if(!div.is_none()) {
+        long n = PyLong_AsLong(div.ptr());
         if(n > 0) r->arcdivision_ = (int)n;
     }
     PyErr_Clear();                      // a canon without one keeps the default
     char name[4];
     for(int i = 0; i < 9; i++) {                // xo, yo, zo, ao .. wo
         snprintf(name, sizeof name, "%co", AXES[i]);
-        if(!get_double(canon, name, r->tool_ + i)) break;
+        try {
+            r->tool_[i] = canon.attr(name).cast<double>();
+        } catch(py::error_already_set &e) {
+            e.restore();
+            break;
+        }
     }
     if(PyErr_Occurred()) {
         delete r;
         return false;
     }
     instance_ = r;
-    owner_ = canon;
+    owner_ = canon_ptr;
     return true;
 }
 
 GCodeRenderer::~GCodeRenderer() {
     delete data_;
-    Py_XDECREF(progress_);
 }
 
 // `(AXIS,hide)` / `(AXIS,show)`: the two words of the comment vocabulary the
@@ -585,48 +439,33 @@ void GCodeRenderer::note_comment(const char *text) {
 }
 
 void GCodeRenderer::sync_out(bool with_line) {
-    if(interp_error) return;
-    PyObject *lo = PyTuple_New(9);
-    if(!lo) { interp_error ++; return; }
-    for(int i = 0; i < 9; i++)
-        PyTuple_SET_ITEM(lo, i, PyFloat_FromDouble(lo_[i]));
-    int bad = PyObject_SetAttrString(canon_, "lo", lo);
-    Py_DECREF(lo);
-    bad |= PyObject_SetAttrString(canon_, "first_move",
-                                  first_move_ ? Py_True : Py_False);
-    if(with_line) {
-        PyObject *n = PyLong_FromLong(last_line_);
-        if(!n) { interp_error ++; return; }
-        bad |= PyObject_SetAttrString(canon_, "lineno", n);
-        Py_DECREF(n);
-    }
-    if(bad) interp_error ++;
+    canon_guard([&]{
+        py::tuple lo(9);
+        for(size_t i = 0; i < 9; i++) lo[i] = lo_[i];
+        canon_.attr("lo") = lo;
+        canon_.attr("first_move") = py::bool_(first_move_);
+        if(with_line) canon_.attr("lineno") = last_line_;
+    });
 }
 
 void GCodeRenderer::sync_in() {
-    if(interp_error) return;
-    PyObject *lo = PyObject_GetAttrString(canon_, "lo");
-    if(!lo) { interp_error ++; return; }
-    PyObject *seq = PySequence_Fast(lo, "canon.lo is not a sequence");
-    Py_DECREF(lo);
-    if(!seq || PySequence_Fast_GET_SIZE(seq) != 9) {
-        Py_XDECREF(seq);
-        if(!PyErr_Occurred())
+    canon_guard([&]{
+        py::object lo = canon_.attr("lo");
+        if(!PySequence_Check(lo.ptr())) {
+            PyErr_SetString(PyExc_TypeError, "canon.lo is not a sequence");
+            throw py::error_already_set();
+        }
+        py::sequence nine = lo.cast<py::sequence>();
+        if(py::len(nine) != 9) {
             PyErr_SetString(PyExc_ValueError, "canon.lo is not nine numbers");
-        interp_error ++;
-        return;
-    }
-    for(int i = 0; i < 9; i++)
-        lo_[i] = PyFloat_AsDouble(PySequence_Fast_GET_ITEM(seq, i));
-    Py_DECREF(seq);
-    if(PyErr_Occurred()) { interp_error ++; return; }
-    PyObject *fm = PyObject_GetAttrString(canon_, "first_move");
-    if(!fm) { interp_error ++; return; }
-    first_move_ = PyObject_IsTrue(fm);
-    Py_DECREF(fm);
+            throw py::error_already_set();
+        }
+        for(size_t i = 0; i < 9; i++) lo_[i] = nine[i].cast<double>();
+        first_move_ = PyObject_IsTrue(canon_.attr("first_move").ptr());
+    });
 }
 
-void GCodeRenderer::transform(const double *in, double *out) const {
+void GCodeRenderer::transform(const Point9 &in, Point9 &out) const {
     for(int i = 0; i < 9; i++) out[i] = in[i] + g92_[i];
     if(rotation_xy_ != 0.0) {
         double rotx = out[0] * rotation_cos_ - out[1] * rotation_sin_;
@@ -639,7 +478,7 @@ void GCodeRenderer::transform(const double *in, double *out) const {
 // The GEOMETRY-string transform (the C vertex9), for one point through one
 // compiled plane.
 static void plane_point(const std::vector<GeomOp> &ops, bool respect,
-                        const double *pts9, double *out) {
+                        const Point9 &pts9, double out[3]) {
     out[0] = out[1] = out[2] = 0.0;
     for(const GeomOp &op : ops) {
         if(!op.rotate) {
@@ -655,7 +494,7 @@ static void plane_point(const std::vector<GeomOp> &ops, bool respect,
     }
 }
 
-void GCodeRenderer::write_vertex(const double *pts9, int line_number,
+void GCodeRenderer::write_vertex(const Point9 &pts9, int line_number,
                                 unsigned char kind, double points[2][3]) {
     if(!data_->reserve(1)) {
         if(!interp_error) PyErr_NoMemory();
@@ -678,13 +517,13 @@ void GCodeRenderer::write_vertex(const double *pts9, int line_number,
     data_->n = at + 1;
 }
 
-void GCodeRenderer::mark(int line_number, const double *at, unsigned char kind,
+void GCodeRenderer::mark(int line_number, const Point9 &at, unsigned char kind,
                         double points[2][3]) {
     write_vertex(at, line_number, kind, points);
 }
 
 // The four machine-frame extent pairs, from one move's raw endpoints.
-void GCodeRenderer::accumulate_extents(const double *p1, const double *p2) {
+void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
     double box[2][3];
     for(int j = 0; j < 3; j++) {
         box[0][j] = p1[j] < p2[j] ? p1[j] : p2[j];
@@ -722,7 +561,7 @@ void GCodeRenderer::accumulate_extents(const double *p1, const double *p2) {
 
 // The g5x XY rotation taken back out about the g5x origin, for the
 // rotation-removed extents. Z is left alone.
-void GCodeRenderer::unrotate_xy(const double *p, double *out) const {
+void GCodeRenderer::unrotate_xy(const Point9 &p, double out[3]) const {
     double tx = p[0] - g5x_[0];
     double ty = p[1] - g5x_[1];
     out[0] = tx * unrot_cos_ - ty * unrot_sin_ + g5x_[0];
@@ -730,7 +569,7 @@ void GCodeRenderer::unrotate_xy(const double *p, double *out) const {
     out[2] = p[2];
 }
 
-void GCodeRenderer::fill(int line_number, const double *p1, const double *p2,
+void GCodeRenderer::fill(int line_number, const Point9 &p1, const Point9 &p2,
                         double feedrate, unsigned char cat) {
     data_->moves ++;
     accumulate_extents(p1, p2);
@@ -742,11 +581,7 @@ void GCodeRenderer::fill(int line_number, const double *p1, const double *p2,
 
     // A move that does not start where the last one ended gets a record vertex
     // at its start; the shaders discard the segment into it.
-    bool jump = !data_->has_cur;
-    if(!jump) {
-        for(int i = 0; i < 9; i++)
-            if(p1[i] != data_->cur9[i]) { jump = true; break; }
-    }
+    bool jump = !data_->has_cur || p1 != data_->cur9;
     // Rotary subdivision: a move that turns A, B or C is drawn as a polyline,
     // since the tool's path through the machine's frame is not a straight line.
     long steps = 1;
@@ -764,16 +599,16 @@ void GCodeRenderer::fill(int line_number, const double *p1, const double *p2,
     long count = steps + (jump ? 1 : 0);
     for(long i = 0; i < count; i++) {
         long sub = i - (jump ? 1 : 0) + 1;
-        double pt[9];
+        Point9 pt;
         if(steps == 1 && !jump) {
-            memcpy(pt, p2, 9 * sizeof(double));
+            pt = p2;
         } else {
             double t = (double)sub / (double)steps;
             for(int k = 0; k < 9; k++) pt[k] = t * p2[k] + (1.0 - t) * p1[k];
         }
         write_vertex(pt, line_number, sub == 0 ? KIND_NOOP : cat, nullptr);
     }
-    memcpy(data_->cur9, p2, 9 * sizeof(double));
+    data_->cur9 = p2;
     data_->has_cur = true;
 }
 
@@ -783,19 +618,18 @@ void GCodeRenderer::move(Kind kind, int line_number,
                           double u, double v, double w, double rate) {
     last_line_ = line_number;
     consumed_ = true;
-    const double in[9] = {x, y, z, a, b, c, u, v, w};
+    const Point9 in = {x, y, z, a, b, c, u, v, w};
     if(kind >= Dwell) { event(kind, line_number, in); return; }
     // A hidden move touches nothing at all, not even the chain point.
     if(suppress_ > 0) return;
 
-    double p[9];
+    Point9 p;
     transform(in, p);
     if(kind == RigidTap) {
         // Down and back up the way it came, joined to the chain point's
         // rotary and UVW components, and the chain point does not move.
-        double end[9];
+        Point9 end = lo_;
         end[0] = p[0]; end[1] = p[1]; end[2] = p[2];
-        for(int i = 3; i < 9; i++) end[i] = lo_[i];
         first_move_ = false;
         fill(line_number, lo_, end, rate / 60., CAT_FEED);
         fill(line_number, end, lo_, rate / 60., CAT_FEED);
@@ -803,12 +637,12 @@ void GCodeRenderer::move(Kind kind, int line_number,
     }
     if(first_move_) {
         // A leading traverse moves the tool without drawing.
-        if(kind == Traverse) { memcpy(lo_, p, sizeof p); return; }
+        if(kind == Traverse) { lo_ = p; return; }
         first_move_ = false;
     }
     if(kind == Traverse) fill(line_number, lo_, p, 0.0, CAT_TRAVERSE);
     else fill(line_number, lo_, p, rate / 60., CAT_FEED);
-    memcpy(lo_, p, sizeof p);
+    lo_ = p;
 }
 
 // CANON_PLANE to the 0/1/2 code a dwell record carries: XY/UV -> 0,
@@ -822,7 +656,7 @@ static int plane_code(int plane) {
 }
 
 void GCodeRenderer::event(Kind kind, int line_number,
-                         const double *axes) {
+                         const Point9 &axes) {
     switch(kind) {
     case ToolOffset:
         // Not forwarded: it moved only the chain point and the offset triple,
@@ -872,10 +706,7 @@ void GCodeRenderer::event(Kind kind, int line_number,
         // canon's tool table for a G43 after this, and a GUI's change_tool
         // override is what moves the simulated spindle slot it reads.
         sync_out(true);
-        if(interp_error) return;
-        PyObject *result = callmethod(canon_, "change_tool", "i", tool);
-        if(!result) { interp_error ++; return; }
-        Py_DECREF(result);
+        canon_guard([&]{ canon_.attr("change_tool")(tool); });
         return;
     }
     default:
@@ -890,9 +721,7 @@ void GCodeRenderer::report_progress() {
     if(!consumed_) return;
     consumed_ = false;
     if(!progress_) return;
-    PyObject *result = PyObject_CallFunction(progress_, "i", last_line_);
-    if(!result) { interp_error ++; return; }
-    Py_DECREF(result);
+    canon_guard([&]{ progress_(last_line_); });
 }
 
 void GCodeRenderer::hand_over() {
@@ -909,17 +738,21 @@ void GCodeRenderer::hand_over() {
     char name[4];
     for(int i = 0; i < 9; i++) {
         snprintf(name, sizeof name, "%co", AXES[i]);
-        PyObject *v = PyFloat_FromDouble(tool_[i]);
-        if(!v || PyObject_SetAttrString(canon_, name, v) < 0) interp_error ++;
-        Py_XDECREF(v);
+        canon_guard([&]{ canon_.attr(name) = tool_[i]; });
     }
     data_->shrink();
-    PyObject *pg = preview_geometry_new(data_);
-    data_ = nullptr;                    // the Python object owns it now
-    if(pg) {
-        PyObject *result = callmethod(canon_, "adopt_geometry", "O", pg);
-        Py_DECREF(pg);
-        Py_XDECREF(result);
+    PreviewData *program = data_;
+    data_ = nullptr;                    // the holder owns it from here, even
+                                        // if the cast below throws
+    try {
+        canon_.attr("adopt_geometry")(preview_geometry_new(program));
+    } catch(py::error_already_set &e) {
+        e.restore();                    // read back off the indicator below
+    } catch(const std::exception &e) {
+        // A failed cast or a failed allocation: the geometry is gone, but the
+        // lines below still have to find *some* error on the indicator, and
+        // must not be skipped by a C++ exception leaving parse_file.
+        PyErr_SetString(PyExc_RuntimeError, e.what());
     }
     // A failure here loses the geometry, but never the reason the parse ended:
     // the first exception wins, and the parse stays failed either way.
@@ -939,19 +772,18 @@ void GCodeRenderer::render_arc(int line_number, double first_end, double second_
     last_line_ = line_number;
     consumed_ = true;
     if(suppress_ > 0) return;
-    int steps = arc_segments(lo_, plane_, rotation_cos_, rotation_sin_,
-                             g5x_, g92_, first_end, second_end,
-                             first_axis, second_axis, rotation,
-                             axis_end_point, a, b, c, u, v, w,
-                             arcdivision_, segs_);
+    arc_segments(lo_, plane_, rotation_cos_, rotation_sin_,
+                 g5x_, g92_, first_end, second_end,
+                 first_axis, second_axis, rotation,
+                 axis_end_point, a, b, c, u, v, w,
+                 arcdivision_, segs_);
     // The segments arrive transformed, so no transform here - and an arc is
     // drawn whether or not it is the program's first move, as the per-move
     // canon draws it.
     first_move_ = false;
-    for(int i = 0; i < steps; i++) {
-        const double *p = &segs_[(size_t)i * 9];
+    for(const Point9 &p : segs_) {
         fill(line_number, lo_, p, rate / 60., CAT_ARC);
-        memcpy(lo_, p, 9 * sizeof(double));
+        lo_ = p;
     }
 }
 
@@ -974,16 +806,15 @@ static void rotate(double &x, double &y, double c, double s) {
     x = tx;
 }
 
-int arc_segments(const double lo[9], int plane,
+int arc_segments(const Point9 &lo, int plane,
                  double rotation_cos, double rotation_sin,
-                 const double g5xoffset[9], const double g92offset[9],
+                 const Point9 &g5xoffset, const Point9 &g92offset,
                  double x1, double y1, double cx, double cy, int rot,
                  double z1, double a, double b, double c,
                  double u, double v, double w,
-                 int max_segments, std::vector<double> &out) {
-    double o[9], n[9];
+                 int max_segments, std::vector<Point9> &out) {
+    Point9 o = lo, n;
     int X, Y, Z;
-    memcpy(o, lo, 9 * sizeof(double));
 
     if(plane == 1) {
         X=0; Y=1; Z=2;
@@ -1026,16 +857,16 @@ int arc_segments(const double lo[9], int plane,
 
     int steps = std::max(3, int(max_segments * fabs(theta1 - theta2) / M_PI));
     double rsteps = 1. / steps;
-    out.resize((size_t)steps * 9);
+    out.resize((size_t)steps);
 
     double dtheta = theta2 - theta1;
-    double d[9] = {0, 0, 0, n[3]-o[3], n[4]-o[4], n[5]-o[5], n[6]-o[6], n[7]-o[7], n[8]-o[8]};
+    Point9 d = {0, 0, 0, n[3]-o[3], n[4]-o[4], n[5]-o[5], n[6]-o[6], n[7]-o[7], n[8]-o[8]};
     d[Z] = n[Z] - o[Z];
 
     double tx = o[X] - cx, ty = o[Y] - cy, dc = cos(dtheta*rsteps), ds = sin(dtheta*rsteps);
     for(int i=0; i<steps-1; i++) {
         double f = (i+1) * rsteps;
-        double *p = &out[(size_t)i * 9];
+        Point9 &p = out[(size_t)i];
         rotate(tx, ty, dc, ds);
         p[X] = tx + cx;
         p[Y] = ty + cy;
@@ -1053,7 +884,7 @@ int arc_segments(const double lo[9], int plane,
     for(int ax=0; ax<9; ax++) n[ax] += g92offset[ax];
     rotate(n[0], n[1], rotation_cos, rotation_sin);
     for(int ax=0; ax<9; ax++) n[ax] += g5xoffset[ax];
-    memcpy(&out[(size_t)(steps-1) * 9], n, 9 * sizeof(double));
+    out[(size_t)steps - 1] = n;
     return steps;
 }
 

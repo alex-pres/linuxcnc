@@ -20,7 +20,9 @@
 #define GCODE_RENDERER_HH
 
 #include <Python.h>
+#include <pybind11/pybind11.h>
 
+#include <array>
 #include <map>
 #include <math.h>
 #include <stdint.h>
@@ -34,7 +36,35 @@ extern PyObject *callback;
 extern int interp_error;
 extern int last_sequence_number;
 
-#define callmethod(o, m, f, ...) PyObject_CallMethod((o), (char*)(m), (char*)(f), ## __VA_ARGS__)
+// Run one canon-side step that touches Python. A failure becomes
+// `interp_error++` with the Python error left set, which is the protocol
+// above; nothing may leave as a C++ exception, because these run from inside
+// Interp::execute() and would unwind past state it owns. Every use of
+// pybind11 on the canon side goes through this or through forward().
+template <typename F>
+static inline void canon_guard(F &&body) {
+    if(interp_error) return;
+    try {
+        body();
+    } catch(pybind11::error_already_set &e) {
+        e.restore();                    // the error stays set, as it was
+        interp_error ++;
+    } catch(pybind11::builtin_exception &e) {
+        e.set_error();                  // py::type_error and friends, by kind
+        interp_error ++;
+    } catch(const std::exception &e) {
+        PyErr_SetString(PyExc_RuntimeError, e.what());
+        interp_error ++;
+    }
+}
+
+// The common case: call a canon method and discard what it returned.
+template <typename... A>
+static inline void forward(const char *method, A &&...args) {
+    canon_guard([&]{
+        pybind11::handle(callback).attr(method)(std::forward<A>(args)...);
+    });
+}
 
 // ---------------------------------------------------------------------------
 // The program the renderer builds: the C++ side of rs274.glcanon_bake's
@@ -42,6 +72,13 @@ extern int last_sequence_number;
 // it. Layouts match that module's PLANE_DTYPE and ATTR_DTYPE exactly, so the
 // arrays reach numpy as views rather than copies.
 // ---------------------------------------------------------------------------
+
+// A point in the interpreter's nine axes, in the order the canon functions
+// take them: x y z a b c u v w. A value, so the chain point and the offsets
+// are copied by assignment rather than by a memcpy whose length is spelled at
+// every call site - `sizeof p` was right only while `p` was an array in scope.
+// Trivially copyable and 72 bytes, so the generated code is what memcpy gave.
+using Point9 = std::array<double, 9>;
 
 // One step of a GEOMETRY string, compiled once per parse. Translate adds an
 // axis of the 9-DOF point to an output component; rotate turns a component
@@ -98,23 +135,24 @@ struct PreviewData {
     std::vector<DwellRecord> dwells;
     std::vector<ToolChangeRecord> toolchanges;
 
-    double cur9[9] = {};                // where the trajectory is
+    Point9 cur9 = {};                   // where the trajectory is
     bool has_cur = false;
 };
 
-// The Python object handed the finished program; takes ownership of `data`.
-PyObject *preview_geometry_new(PreviewData *data);
-bool preview_geometry_ready();
+// The finished program as `gcode.PreviewGeometry`; takes ownership of `data`.
+pybind11::object preview_geometry_new(PreviewData *data);
+// Register PreviewGeometry and its array views on the module.
+void preview_geometry_register(pybind11::module_ &m);
 
 // One arc as up to `max_segments`-ish 9-DOF points, transformed the way a move
 // is. Shared by gcode.arc_to_segments and the renderer.
-int arc_segments(const double lo[9], int plane,
+int arc_segments(const Point9 &lo, int plane,
                  double rotation_cos, double rotation_sin,
-                 const double g5xoffset[9], const double g92offset[9],
+                 const Point9 &g5xoffset, const Point9 &g92offset,
                  double x1, double y1, double cx, double cy, int rot,
                  double z1, double a, double b, double c,
                  double u, double v, double w,
-                 int max_segments, std::vector<double> &out);
+                 int max_segments, std::vector<Point9> &out);
 
 
 // ---------------------------------------------------------------------------
@@ -202,7 +240,10 @@ int arc_segments(const double lo[9], int plane,
 // was armed for, compared - never dereferenced - on every entry point, so a
 // mismatch raises instead of misdrawing.
 
-class GCodeRenderer {
+// Hidden visibility, as pybind11 asks of anything holding a py::object: its
+// own types are hidden, and a default-visibility class with one as a member
+// is an ODR hazard across shared objects (and a -Wattributes warning here).
+class __attribute__((visibility("hidden"))) GCodeRenderer {
 public:
     // What a canon function reports. Kinds 0-3 are moves; 4-7 are the events
     // between them, carrying their payload in the axis arguments:
@@ -259,8 +300,8 @@ public:
     // forwarded, so a canon that watches offsets and rotation sees every one;
     // these are called in the same place, after a successful forward, and are
     // where the fill's own copy comes from.
-    static void set_g5x(const double offsets[9]);
-    static void set_g92(const double offsets[9]);
+    static void set_g5x(const Point9 &offsets);
+    static void set_g92(const Point9 &offsets);
     static void set_rotation_xy(double degrees);
     // End of parse: hand the program over and give the canon back the state the
     // renderer took over, so a reader of canon.lo/first_move/xo..wo sees what
@@ -292,7 +333,7 @@ public:
     static void spindle_speed(double rpm) { speed_ = rpm; }
 
 private:
-    explicit GCodeRenderer(PyObject *canon) : canon_(canon) {}
+    explicit GCodeRenderer(pybind11::handle canon) : canon_(canon) {}
     GCodeRenderer(const GCodeRenderer &) = delete;
     GCodeRenderer &operator=(const GCodeRenderer &) = delete;
     ~GCodeRenderer();
@@ -324,39 +365,39 @@ private:
     void sync_out(bool with_line);
     void sync_in();
     // One move into the geometry: extents, length, then its vertices.
-    void fill(int line_number, const double *p1, const double *p2,
+    void fill(int line_number, const Point9 &p1, const Point9 &p2,
               double feedrate, unsigned char cat);
     // One record vertex at `at`, writing its per-plane position to `points`.
-    void mark(int line_number, const double *at, unsigned char kind,
+    void mark(int line_number, const Point9 &at, unsigned char kind,
               double points[2][3]);
-    void write_vertex(const double *pts9, int line_number, unsigned char kind,
+    void write_vertex(const Point9 &pts9, int line_number, unsigned char kind,
                       double points[2][3]);
-    void accumulate_extents(const double *p1, const double *p2);
+    void accumulate_extents(const Point9 &p1, const Point9 &p2);
     bool read_planes();
-    void unrotate_xy(const double *p, double *out) const;
+    void unrotate_xy(const Point9 &p, double out[3]) const;
     // g92 -> XY rotation -> g5x, the operations and the order
     // `rs274.interpret.Translated.rotate_and_translate` applies - which is
     // where this came from, though that method no longer runs on a rendered
     // parse. Not bit-identical to it by construction: the compiler is free to
     // contract the rotation's multiply-add, so the tests allow a few ULPs.
-    void transform(const double *in, double *out) const;
-    void event(Kind kind, int line_number, const double *axes);
+    void transform(const Point9 &in, Point9 &out) const;
+    void event(Kind kind, int line_number, const Point9 &axes);
 
-    PyObject *canon_;                   // borrowed, as owner_ is
-    PyObject *progress_ = nullptr;      // canon.renderer_progress, or null
+    pybind11::handle canon_;            // borrowed, as owner_ is
+    pybind11::object progress_;         // canon.renderer_progress, or empty
     PreviewData *data_ = nullptr;       // the program being built, owned
     bool handed_over_ = false;
 
     // The transform, zero until the interpreter's startup re-issues it.
-    double g92_[9] = {};
-    double g5x_[9] = {};
+    Point9 g92_ = {};
+    Point9 g5x_ = {};
     double rotation_xy_ = 0.0;
     double rotation_cos_ = 1.0;
     double rotation_sin_ = 0.0;
     double unrot_cos_ = 1.0;            // the same rotation, negated, for the
     double unrot_sin_ = 0.0;            // rotation-removed extents
-    double lo_[9] = {};                 // chain point
-    double tool_[9] = {};               // xo..wo
+    Point9 lo_ = {};                    // chain point
+    Point9 tool_ = {};                  // xo..wo
     bool first_move_ = true;
     // The `(AXIS,hide)` depth, counted here from the comments themselves.
     // A parse starts at zero: a canon that set `suppress` before the parse
@@ -365,7 +406,7 @@ private:
     bool respect_offsets_ = false;
     int plane_ = 1;                     // CANON_PLANE, for arc segmentation
     int arcdivision_ = 64;              // the canon's, read once at arm time
-    std::vector<double> segs_;          // reused by render_arc()
+    std::vector<Point9> segs_;          // reused by render_arc()
 
     // Progress is reported once per delivery that consumed anything, moves or
     // not: a hidden stretch still costs parse time.
