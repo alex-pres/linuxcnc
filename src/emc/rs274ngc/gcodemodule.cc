@@ -869,8 +869,18 @@ static py::object parse_file(const char *f, py::handle canon,
     // gates is two Python calls - nothing beside a parse.
     // steady_clock, not gettimeofday: a wall clock can step backwards under
     // NTP and stall the tick for as long as the step.
+    //
+    // Read every 1024 lines rather than every line. The clock is ~15ns and a
+    // line is ~800ns, so per-line it was about 2% of the parse for a question
+    // whose answer changes once in 125000 lines. 1024 lines is under a
+    // millisecond of ordinary parsing - two orders finer than the tick - and
+    // on a file slow enough for that to matter (heavy O-word subs, NURBS) it
+    // degrades to about the tick itself rather than past it. Which also
+    // bounds how long a cancel waits, since check_abort() is on this tick.
     using clock = std::chrono::steady_clock;
     const auto tick = std::chrono::milliseconds(100);
+    constexpr unsigned long clock_every = 1024;         // a power of two: one
+    unsigned long lines_read = 0;                       // `and` per line
     clock::time_point last;
     int result = INTERP_OK;
 
@@ -943,19 +953,23 @@ static py::object parse_file(const char *f, py::handle canon,
     while(!interp_error && RESULT_OK) {
         error_line_offset = 1;
         result = pinterp->read();
-        clock::time_point now = clock::now();
-        if(now - last >= tick) {
-            // Bounds how stale a canon's progress report can get through a
-            // long run of moves on one line, and keeps check_abort() - which
-            // pumps AXIS's event loop - from running with a pending exception
-            // raised by the report.
-            GCodeRenderer::progress();
-            if(interp_error) break;
-            if(check_abort()) {
-                GCodeRenderer::finish();
-                throw py::error_already_set();
+        if((++lines_read & (clock_every - 1)) == 0) {
+            clock::time_point now = clock::now();
+            if(now - last >= tick) {
+                // Bounds how stale a canon's progress report can get through
+                // a long run of moves on one line, and keeps check_abort() -
+                // which pumps AXIS's event loop - from running with a pending
+                // exception raised by the report.
+                GCodeRenderer::progress();
+                if(interp_error) break;
+                if(check_abort()) {
+                    GCodeRenderer::finish();
+                    throw py::error_already_set();
+                }
+                // The reading taken before the two calls, so a slow repaint
+                // does not push the next tick out by its own duration.
+                last = now;
             }
-            last = now;
         }
         if(!RESULT_OK) break;
         error_line_offset = 0;
