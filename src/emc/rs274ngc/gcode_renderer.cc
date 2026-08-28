@@ -20,6 +20,7 @@
 // the one entry point a canon function reaches per move stays inline in
 // gcode_renderer.hh, where the call sites can see it.
 
+#include <algorithm>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -85,7 +86,7 @@ double GCodeRenderer::external_angle_units() {
 // One parse's renderer
 // ---------------------------------------------------------------------------
 
-static const char AXES[9] = {'x','y','z','a','b','c','u','v','w'};
+static const char AXES[P9_COUNT] = {'x','y','z','a','b','c','u','v','w'};
 
 // ---------------------------------------------------------------------------
 // PreviewData: storage, growth, and the Python object it is handed over in
@@ -104,7 +105,7 @@ bool PreviewData::reserve(size_t extra) {
     while(want < need) want *= 2;
     float *grown[MAX_PLANES] = {};
     for(int i = 0; i < nplanes; i++) {
-        grown[i] = (float*)realloc(pos[i], want * POINT_DIMS * sizeof(float));
+        grown[i] = (float*)realloc(pos[i], want * P3_COUNT * sizeof(float));
         if(!grown[i]) {
             // Whatever did grow is still valid and still holds the program;
             // only `cap` decides what may be written, so leaving it alone is
@@ -131,7 +132,7 @@ void PreviewData::shrink() {
     if(cap == n) return;
     size_t want = n ? n : 1;
     for(int i = 0; i < nplanes; i++) {
-        float *fit = (float*)realloc(pos[i], want * POINT_DIMS * sizeof(float));
+        float *fit = (float*)realloc(pos[i], want * P3_COUNT * sizeof(float));
         if(fit) pos[i] = fit;           // a refused shrink keeps the slack
     }
     uint32_t *fit = (uint32_t*)realloc(attrs, want * ATTRS_PER_VERTEX * sizeof(uint32_t));
@@ -154,7 +155,7 @@ static py::object array_view(py::object owner, void *ptr, Py_ssize_t nitems,
 }
 
 static py::tuple triple(const Point3 &v) {
-    return py::make_tuple(v[0], v[1], v[2]);
+    return py::make_tuple(v[P3_X], v[P3_Y], v[P3_Z]);
 }
 
 static py::tuple points_tuple(const PlanePoints &pts, int nplanes) {
@@ -185,7 +186,7 @@ void preview_geometry_register(py::module_ &m) {
                 if(plane < 0 || plane >= d.nplanes)
                     throw py::index_error("no such drawn plane");
                 return array_view(std::move(self), d.pos[plane],
-                                  (Py_ssize_t)d.n * POINT_DIMS, sizeof(float), "f");
+                                  (Py_ssize_t)d.n * P3_COUNT, sizeof(float), "f");
             }, py::arg("plane") = 0,
             "Read-only float32 xyz view of one drawn plane")
         .def("attrs", [](py::object self) {
@@ -197,12 +198,13 @@ void preview_geometry_register(py::module_ &m) {
         .def("extents", [](const PreviewData &d) {
                 py::tuple out(EXTENT_KINDS);
                 for(int i = 0; i < EXTENT_KINDS; i++)
-                    out[i] = py::make_tuple(triple(d.extents[i][0]),
-                                            triple(d.extents[i][1]));
+                    out[i] = py::make_tuple(triple(d.extents[i][BOX_MIN]),
+                                            triple(d.extents[i][BOX_MAX]));
                 return out;
             }, "The four machine-frame (min, max) pairs")
         .def("drawn_extents", [](const PreviewData &d) {
-                return py::make_tuple(triple(d.drawn[0]), triple(d.drawn[1]));
+                return py::make_tuple(triple(d.drawn[BOX_MIN]),
+                                      triple(d.drawn[BOX_MAX]));
             }, "(min, max) over the transformed points in the array")
         .def("cut_lengths", [](const PreviewData &d) {
                 py::dict out;
@@ -352,13 +354,13 @@ std::unique_ptr<GCodeRenderer> GCodeRenderer::make(PyObject *canon_ptr) {
     std::unique_ptr<GCodeRenderer> r(new GCodeRenderer(canon));
     r->data_ = new PreviewData();
     for(int i = 0; i < EXTENT_KINDS; i++)
-        for(int j = 0; j < POINT_DIMS; j++) {
-            r->data_->extents[i][0][j] = 9e99;
-            r->data_->extents[i][1][j] = -9e99;
+        for(int j = 0; j < P3_COUNT; j++) {
+            r->data_->extents[i][BOX_MIN][j] = 9e99;
+            r->data_->extents[i][BOX_MAX][j] = -9e99;
         }
-    for(int j = 0; j < POINT_DIMS; j++) {
-        r->data_->drawn[0][j] = 9e99;
-        r->data_->drawn[1][j] = -9e99;
+    for(int j = 0; j < P3_COUNT; j++) {
+        r->data_->drawn[BOX_MIN][j] = 9e99;
+        r->data_->drawn[BOX_MAX][j] = -9e99;
     }
     r->data_->tool_numbers.push_back(0);         // ordinal 0 is None
     if(!r->read_planes()) return nullptr;
@@ -415,8 +417,8 @@ void GCodeRenderer::comment(const char *text) {
 
 void GCodeRenderer::sync_out(bool with_line) {
     canon_guard([&]{
-        py::tuple lo(9);
-        for(size_t i = 0; i < 9; i++) lo[i] = lo_[i];
+        py::tuple lo(static_cast<size_t>(P9_COUNT));
+        for(int i = 0; i < P9_COUNT; i++) lo[i] = lo_[i];
         canon_.attr("lo") = lo;
         canon_.attr("first_move") = py::bool_(first_move_);
         if(with_line) canon_.attr("lineno") = last_line_;
@@ -431,30 +433,30 @@ void GCodeRenderer::sync_in() {
             throw py::error_already_set();
         }
         py::sequence nine = lo.cast<py::sequence>();
-        if(py::len(nine) != 9) {
+        if(py::len(nine) != P9_COUNT) {
             PyErr_SetString(PyExc_ValueError, "canon.lo is not nine numbers");
             throw py::error_already_set();
         }
-        for(size_t i = 0; i < 9; i++) lo_[i] = nine[i].cast<double>();
+        for(int i = 0; i < P9_COUNT; i++) lo_[i] = nine[i].cast<double>();
         first_move_ = PyObject_IsTrue(canon_.attr("first_move").ptr());
     });
 }
 
 void GCodeRenderer::transform(const Point9 &in, Point9 &out) const {
-    for(int i = 0; i < 9; i++) out[i] = in[i] + g92_[i];
+    out = in + g92_;
     if(rotation_xy_ != 0.0) {
-        double rotx = out[0] * rotation_cos_ - out[1] * rotation_sin_;
-        out[1] = out[0] * rotation_sin_ + out[1] * rotation_cos_;
-        out[0] = rotx;
+        double rotx = out[P9_X] * rotation_cos_ - out[P9_Y] * rotation_sin_;
+        out[P9_Y] = out[P9_X] * rotation_sin_ + out[P9_Y] * rotation_cos_;
+        out[P9_X] = rotx;
     }
-    for(int i = 0; i < 9; i++) out[i] += g5x_[i];
+    out += g5x_;
 }
 
 // The GEOMETRY-string transform (the C vertex9), for one point through one
 // compiled plane.
 static void plane_point(const std::vector<GeomOp> &ops,
                         const Point9 &pts9, Point3 &out) {
-    out[0] = out[1] = out[2] = 0.0;
+    out = {};
     for(const GeomOp &op : ops) op.apply(pts9, out);
 }
 
@@ -469,10 +471,10 @@ void GCodeRenderer::write_vertex(const Point9 &pts9, int line_number,
     for(int i = 0; i < data_->nplanes; i++) {
         Point3 p;
         plane_point(data_->ops[i], pts9, p);
-        for(int j = 0; j < POINT_DIMS; j++) {
-            if(p[j] < data_->drawn[0][j]) data_->drawn[0][j] = p[j];
-            if(p[j] > data_->drawn[1][j]) data_->drawn[1][j] = p[j];
-            data_->pos[i][at * POINT_DIMS + j] = (float)p[j];
+        for(int j = 0; j < P3_COUNT; j++) {
+            if(p[j] < data_->drawn[BOX_MIN][j]) data_->drawn[BOX_MIN][j] = p[j];
+            if(p[j] > data_->drawn[BOX_MAX][j]) data_->drawn[BOX_MAX][j] = p[j];
+            data_->pos[i][at * P3_COUNT + j] = (float)p[j];
             if(points) (*points)[i][j] = p[j];
         }
     }
@@ -490,21 +492,21 @@ void GCodeRenderer::mark(int line_number, const Point9 &at,
 // The four machine-frame extent pairs, from one move's raw endpoints.
 void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
     Box3 box;
-    for(int j = 0; j < POINT_DIMS; j++) {
-        box[0][j] = p1[j] < p2[j] ? p1[j] : p2[j];
-        box[1][j] = p1[j] > p2[j] ? p1[j] : p2[j];
+    for(int j = 0; j < P3_COUNT; j++) {
+        box[BOX_MIN][j] = std::min(p1[j], p2[j]);
+        box[BOX_MAX][j] = std::max(p1[j], p2[j]);
     }
     // The tool-corrected box is the raw box shifted: adding a constant is
     // monotonic, so this is the same box, not an approximation of it.
-    Point3 shift = {tool_[0], tool_[1], tool_[2]};
+    Point3 shift = {tool_[P9_X], tool_[P9_Y], tool_[P9_Z]};
     Box3 rot;
     if(rotation_xy_ != 0.0) {
         Point3 u1, u2;
         unrotate_xy(p1, u1);
         unrotate_xy(p2, u2);
-        for(int j = 0; j < POINT_DIMS; j++) {
-            rot[0][j] = u1[j] < u2[j] ? u1[j] : u2[j];
-            rot[1][j] = u1[j] > u2[j] ? u1[j] : u2[j];
+        for(int j = 0; j < P3_COUNT; j++) {
+            rot[BOX_MIN][j] = std::min(u1[j], u2[j]);
+            rot[BOX_MAX][j] = std::max(u1[j], u2[j]);
         }
     }
     // raw, notool, zero_rxy, notool_zero_rxy - and with no rotation to remove,
@@ -512,14 +514,16 @@ void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
     bool rotated = rotation_xy_ != 0.0;
     for(int i = 0; i < EXTENT_KINDS; i++) {
         bool unrotated = (i >= 2) && rotated;
-        const Point3 &lo = unrotated ? rot[0] : box[0];
-        const Point3 &hi = unrotated ? rot[1] : box[1];
+        const Point3 &lo = unrotated ? rot[BOX_MIN] : box[BOX_MIN];
+        const Point3 &hi = unrotated ? rot[BOX_MAX] : box[BOX_MAX];
         bool notool = (i == 1 || i == 3);
-        for(int j = 0; j < POINT_DIMS; j++) {
+        for(int j = 0; j < P3_COUNT; j++) {
             double a = notool ? lo[j] + shift[j] : lo[j];
             double b = notool ? hi[j] + shift[j] : hi[j];
-            if(a < data_->extents[i][0][j]) data_->extents[i][0][j] = a;
-            if(b > data_->extents[i][1][j]) data_->extents[i][1][j] = b;
+            if(a < data_->extents[i][BOX_MIN][j])
+                data_->extents[i][BOX_MIN][j] = a;
+            if(b > data_->extents[i][BOX_MAX][j])
+                data_->extents[i][BOX_MAX][j] = b;
         }
     }
 }
@@ -527,11 +531,11 @@ void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
 // The g5x XY rotation taken back out about the g5x origin, for the
 // rotation-removed extents. Z is left alone.
 void GCodeRenderer::unrotate_xy(const Point9 &p, Point3 &out) const {
-    double tx = p[0] - g5x_[0];
-    double ty = p[1] - g5x_[1];
-    out[0] = tx * unrot_cos_ - ty * unrot_sin_ + g5x_[0];
-    out[1] = tx * unrot_sin_ + ty * unrot_cos_ + g5x_[1];
-    out[2] = p[2];
+    double tx = p[P9_X] - g5x_[P9_X];
+    double ty = p[P9_Y] - g5x_[P9_Y];
+    out[P3_X] = tx * unrot_cos_ - ty * unrot_sin_ + g5x_[P9_X];
+    out[P3_Y] = tx * unrot_sin_ + ty * unrot_cos_ + g5x_[P9_Y];
+    out[P3_Z] = p[P9_Z];
 }
 
 void GCodeRenderer::fill(int line_number, const Point9 &p1, const Point9 &p2,
@@ -539,7 +543,8 @@ void GCodeRenderer::fill(int line_number, const Point9 &p1, const Point9 &p2,
     data_->moves ++;
     accumulate_extents(p1, p2);
 
-    double dx = p2[0] - p1[0], dy = p2[1] - p1[1], dz = p2[2] - p1[2];
+    double dx = p2[P9_X] - p1[P9_X], dy = p2[P9_Y] - p1[P9_Y],
+           dz = p2[P9_Z] - p1[P9_Z];
     double len = sqrt(dx * dx + dy * dy + dz * dz);
     if(cat == CAT_TRAVERSE) data_->rapid_length += len;
     else data_->cut_length[feedrate] += len;
@@ -569,7 +574,8 @@ void GCodeRenderer::fill(int line_number, const Point9 &p1, const Point9 &p2,
             pt = p2;
         } else {
             double t = (double)sub / (double)steps;
-            for(int k = 0; k < 9; k++) pt[k] = t * p2[k] + (1.0 - t) * p1[k];
+            for(int k = 0; k < P9_COUNT; k++)
+                pt[k] = t * p2[k] + (1.0 - t) * p1[k];
         }
         write_vertex(pt, line_number, sub == 0 ? KIND_NOOP : cat, nullptr);
     }
@@ -591,7 +597,7 @@ void GCodeRenderer::move(Kind kind, int line_number, const Point9 &in,
         // Down and back up the way it came, joined to the chain point's
         // rotary and UVW components, and the chain point does not move.
         Point9 end = lo_;
-        end[0] = p[0]; end[1] = p[1]; end[2] = p[2];
+        end[P9_X] = p[P9_X]; end[P9_Y] = p[P9_Y]; end[P9_Z] = p[P9_Z];
         first_move_ = false;
         fill(line_number, lo_, end, rate / 60., CAT_FEED);
         fill(line_number, end, lo_, rate / 60., CAT_FEED);
@@ -624,28 +630,26 @@ void GCodeRenderer::event(Kind kind, int line_number,
         // Not forwarded: it moved only the chain point and the offset triple,
         // and both live here now.
         first_move_ = true;
-        for(int i = 0; i < 9; i++) {
-            lo_[i] = lo_[i] - axes[i] + tool_[i];
-            tool_[i] = axes[i];
-        }
+        lo_ = lo_ - axes + tool_;
+        tool_ = axes;
         return;
     case Dwell:
     case M1xx: {
         // Both are markers at the current position; a hidden one is dropped,
         // as the canon methods they replace drop it.
         if(suppress_ > 0) return;
-        if(kind == Dwell) data_->dwell_time += axes[0];
+        if(kind == Dwell) data_->dwell_time += axes[P9_X];
         DwellRecord rec = {};
         rec.lineno = line_number;
         rec.plane = plane_code(plane_);
         rec.m1xx = (kind == M1xx);
-        rec.raw = {lo_[0], lo_[1], lo_[2]};
+        rec.raw = {lo_[P9_X], lo_[P9_Y], lo_[P9_Z]};
         mark(line_number, lo_, KIND_DWELL, &rec.pts);
         data_->dwells.push_back(rec);
         return;
     }
     case ChangeTool: {
-        int tool = (int)axes[0];
+        int tool = (int)axes[P9_X];
         // The record vertex carries the *new* ordinal: it marks where the new
         // tool's work begins. 65535 changes in one program reuse the last
         // ordinal rather than wrap onto another tool's entry.
@@ -698,7 +702,7 @@ void GCodeRenderer::hand_over() {
     parse_state.interp_error = 0;
     sync_out(false);
     char name[4];
-    for(int i = 0; i < 9; i++) {
+    for(int i = 0; i < P9_COUNT; i++) {
         snprintf(name, sizeof name, "%co", AXES[i]);
         canon_guard([&]{ canon_.attr(name) = tool_[i]; });
     }
@@ -788,15 +792,15 @@ int arc_segments(const Point9 &lo, int plane,
     n[X] = x1;
     n[Y] = y1;
     n[Z] = z1;
-    n[3] = a;
-    n[4] = b;
-    n[5] = c;
-    n[6] = u;
-    n[7] = v;
-    n[8] = w;
-    for(int ax=0; ax<9; ax++) o[ax] -= g5xoffset[ax];
-    unrotate(o[0], o[1], rotation_cos, rotation_sin);
-    for(int ax=0; ax<9; ax++) o[ax] -= g92offset[ax];
+    n[P9_A] = a;
+    n[P9_B] = b;
+    n[P9_C] = c;
+    n[P9_U] = u;
+    n[P9_V] = v;
+    n[P9_W] = w;
+    o -= g5xoffset;
+    unrotate(o[P9_X], o[P9_Y], rotation_cos, rotation_sin);
+    o -= g92offset;
 
     double theta1 = atan2(o[Y]-cy, o[X]-cx);
     double theta2 = atan2(n[Y]-cy, n[X]-cx);
@@ -822,7 +826,9 @@ int arc_segments(const Point9 &lo, int plane,
     out.resize((size_t)steps);
 
     double dtheta = theta2 - theta1;
-    Point9 d = {0, 0, 0, n[3]-o[3], n[4]-o[4], n[5]-o[5], n[6]-o[6], n[7]-o[7], n[8]-o[8]};
+    Point9 d = {0, 0, 0,
+                n[P9_A]-o[P9_A], n[P9_B]-o[P9_B], n[P9_C]-o[P9_C],
+                n[P9_U]-o[P9_U], n[P9_V]-o[P9_V], n[P9_W]-o[P9_W]};
     d[Z] = n[Z] - o[Z];
 
     double tx = o[X] - cx, ty = o[Y] - cy, dc = cos(dtheta*rsteps), ds = sin(dtheta*rsteps);
@@ -833,19 +839,19 @@ int arc_segments(const Point9 &lo, int plane,
         p[X] = tx + cx;
         p[Y] = ty + cy;
         p[Z] = o[Z] + d[Z] * f;
-        p[3] = o[3] + d[3] * f;
-        p[4] = o[4] + d[4] * f;
-        p[5] = o[5] + d[5] * f;
-        p[6] = o[6] + d[6] * f;
-        p[7] = o[7] + d[7] * f;
-        p[8] = o[8] + d[8] * f;
-        for(int ax=0; ax<9; ax++) p[ax] += g92offset[ax];
-        rotate(p[0], p[1], rotation_cos, rotation_sin);
-        for(int ax=0; ax<9; ax++) p[ax] += g5xoffset[ax];
+        p[P9_A] = o[P9_A] + d[P9_A] * f;
+        p[P9_B] = o[P9_B] + d[P9_B] * f;
+        p[P9_C] = o[P9_C] + d[P9_C] * f;
+        p[P9_U] = o[P9_U] + d[P9_U] * f;
+        p[P9_V] = o[P9_V] + d[P9_V] * f;
+        p[P9_W] = o[P9_W] + d[P9_W] * f;
+        p += g92offset;
+        rotate(p[P9_X], p[P9_Y], rotation_cos, rotation_sin);
+        p += g5xoffset;
     }
-    for(int ax=0; ax<9; ax++) n[ax] += g92offset[ax];
-    rotate(n[0], n[1], rotation_cos, rotation_sin);
-    for(int ax=0; ax<9; ax++) n[ax] += g5xoffset[ax];
+    n += g92offset;
+    rotate(n[P9_X], n[P9_Y], rotation_cos, rotation_sin);
+    n += g5xoffset;
     out[(size_t)steps - 1] = n;
     return steps;
 }

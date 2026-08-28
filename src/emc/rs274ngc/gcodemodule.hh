@@ -32,12 +32,65 @@
 
 #include <emcpos.h>
 
-// A point in the interpreter's nine axes, in the order the canon functions
-// take them: x y z a b c u v w. A value, so the chain point and the offsets
-// are copied by assignment rather than by a memcpy whose length is spelled at
-// every call site - `sizeof p` was right only while `p` was an array in scope.
-// Trivially copyable and 72 bytes, so the generated code is what memcpy gave.
-using Point9 = std::array<double, 9>;
+// What a Point9's nine slots are, and the order the canon functions take them
+// in. Plain and unscoped so it indexes without a cast - `p[P9_Y]` - and
+// prefixed so the letters do not collide with anything. `P9_COUNT` is
+// what sizes Point9, so the two cannot drift apart.
+enum {
+    P9_X, P9_Y, P9_Z,
+    P9_A, P9_B, P9_C,
+    P9_U, P9_V, P9_W,
+    P9_COUNT
+};
+
+// A point in the interpreter's nine axes. A value, so the chain point and the
+// offsets are copied by assignment rather than by a memcpy whose length is
+// spelled at every call site - `sizeof p` was right only while `p` was an
+// array in scope. Trivially copyable and 72 bytes, so the generated code is
+// what memcpy gave.
+using Point9 = std::array<double, P9_COUNT>;
+
+// Whole-point arithmetic, so the transform and the arc segmenter read as the
+// vector operations they are rather than as nine-iteration loops. Componentwise
+// throughout, in the order the loops they replace used, so the results are the
+// same bits and not merely the same value.
+//
+// Note what a scalar means on each side: `p * 2.0` scales every component,
+// while `p + 2.0` *adds two to all nine* - two inches of X and two degrees of
+// A. That is rarely what a caller means, and nothing here uses it; it is
+// defined only because the set is easier to remember whole than in part.
+inline Point9 &operator+=(Point9 &a, const Point9 &b) {
+    for(int i = 0; i < P9_COUNT; i++) a[i] += b[i];
+    return a;
+}
+inline Point9 &operator-=(Point9 &a, const Point9 &b) {
+    for(int i = 0; i < P9_COUNT; i++) a[i] -= b[i];
+    return a;
+}
+inline Point9 &operator+=(Point9 &a, double s) {
+    for(int i = 0; i < P9_COUNT; i++) a[i] += s;
+    return a;
+}
+inline Point9 &operator-=(Point9 &a, double s) {
+    for(int i = 0; i < P9_COUNT; i++) a[i] -= s;
+    return a;
+}
+inline Point9 &operator*=(Point9 &a, double s) {
+    for(int i = 0; i < P9_COUNT; i++) a[i] *= s;
+    return a;
+}
+inline Point9 &operator/=(Point9 &a, double s) {
+    for(int i = 0; i < P9_COUNT; i++) a[i] /= s;
+    return a;
+}
+
+inline Point9 operator+(Point9 a, const Point9 &b) { return a += b; }
+inline Point9 operator-(Point9 a, const Point9 &b) { return a -= b; }
+inline Point9 operator+(Point9 a, double s) { return a += s; }
+inline Point9 operator-(Point9 a, double s) { return a -= s; }
+inline Point9 operator*(Point9 a, double s) { return a *= s; }
+inline Point9 operator/(Point9 a, double s) { return a /= s; }
+inline Point9 operator*(double s, Point9 a) { return a *= s; }
 
 // ---------------------------------------------------------------------------
 // The canon protocol
@@ -155,9 +208,7 @@ struct ParseState {
     bool in_parse = false;
     // Where the program is, machine units, raw - what the probe/position
     // getters answer with.
-    double pos_x = 0, pos_y = 0, pos_z = 0,
-           pos_a = 0, pos_b = 0, pos_c = 0,
-           pos_u = 0, pos_v = 0, pos_w = 0;
+    Point9 pos = {};
     EmcPose tool_offset = {};
 
     // The line number for a canon event that is not given one.

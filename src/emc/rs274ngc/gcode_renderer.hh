@@ -42,18 +42,23 @@
 // A program is drawn once per plane: one plane for a mill, two when a lathe
 // draws its mirrored back side beside the front.
 constexpr int MAX_PLANES = 2;
-// A drawn point is xyz, and a box around drawn points is a min and a max.
-constexpr int POINT_DIMS = 3;
-constexpr int BOX_BOUNDS = 2;
+// The two bounds of a box around drawn points, and - as with P3_COUNT and
+// P9_COUNT - the count that sizes one.
+enum { BOX_MIN, BOX_MAX, BOX_BOUNDS };
 // The machine-frame extent boxes a program keeps: raw, notool, zero_rxy and
 // notool_zero_rxy, in that order - the four `calc_extents` has always given.
 constexpr int EXTENT_KINDS = 4;
 // Per vertex, beside its xyz: the line number, then kind|tool.
 constexpr int ATTRS_PER_VERTEX = 2;
 
+// What a Point3's three slots are, as P9_X..P9_W are a Point9's, and what
+// sizes it. A drawn point is xyz and nothing else: the rotary and UVW axes
+// have already been folded in by the GEOMETRY transform.
+enum { P3_X, P3_Y, P3_Z, P3_COUNT };
+
 // Point9's drawn counterpart: one xyz, the same point once per drawn plane,
 // and a (min, max) box over such points.
-using Point3 = std::array<double, POINT_DIMS>;
+using Point3 = std::array<double, P3_COUNT>;
 using PlanePoints = std::array<Point3, MAX_PLANES>;
 using Box3 = std::array<Point3, BOX_BOUNDS>;
 
@@ -118,7 +123,7 @@ struct PreviewData {
 
     int nplanes = 1;
     std::vector<GeomOp> ops[MAX_PLANES];    // one compiled transform per plane
-    float *pos[MAX_PLANES] = {};        // POINT_DIMS floats per vertex, per plane
+    float *pos[MAX_PLANES] = {};        // P3_COUNT floats per vertex, per plane
     uint32_t *attrs = nullptr;          // line, kind|tool per vertex
     size_t n = 0, cap = 0;
 
@@ -416,6 +421,7 @@ private:
     double rotation_sin_ = 0.0;
     double unrot_cos_ = 1.0;            // the same rotation, negated, for the
     double unrot_sin_ = 0.0;            // rotation-removed extents
+
     Point9 lo_ = {};                    // chain point
     Point9 tool_ = {};                  // xo..wo
     bool first_move_ = true;

@@ -207,18 +207,21 @@ public:
     }
     void straight_feed(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
-        forward("straight_feed", p[0], p[1], p[2], p[3], p[4], p[5],
-                p[6], p[7], p[8]);
+        forward("straight_feed", p[P9_X], p[P9_Y], p[P9_Z],
+                p[P9_A], p[P9_B], p[P9_C],
+                p[P9_U], p[P9_V], p[P9_W]);
     }
     void straight_traverse(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
-        forward("straight_traverse", p[0], p[1], p[2], p[3], p[4], p[5],
-                p[6], p[7], p[8]);
+        forward("straight_traverse", p[P9_X], p[P9_Y], p[P9_Z],
+                p[P9_A], p[P9_B], p[P9_C],
+                p[P9_U], p[P9_V], p[P9_W]);
     }
     void straight_probe(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
-        forward("straight_probe", p[0], p[1], p[2], p[3], p[4], p[5],
-                p[6], p[7], p[8]);
+        forward("straight_probe", p[P9_X], p[P9_Y], p[P9_Z],
+                p[P9_A], p[P9_B], p[P9_C],
+                p[P9_U], p[P9_V], p[P9_W]);
     }
     void rigid_tap(int line_number, double x, double y, double z) override {
         maybe_new_line(line_number);
@@ -238,18 +241,22 @@ public:
     }
     void tool_offset(const Point9 &o) override {
         maybe_new_line();
-        forward("tool_offset", o[0], o[1], o[2], o[3], o[4], o[5],
-                o[6], o[7], o[8]);
+        forward("tool_offset", o[P9_X], o[P9_Y], o[P9_Z],
+                o[P9_A], o[P9_B], o[P9_C],
+                o[P9_U], o[P9_V], o[P9_W]);
     }
     void set_g5x_offset(int index, const Point9 &o) override {
         maybe_new_line();
-        forward("set_g5x_offset", index, o[0], o[1], o[2], o[3], o[4], o[5],
-                o[6], o[7], o[8]);
+        forward("set_g5x_offset", index,
+                o[P9_X], o[P9_Y], o[P9_Z],
+                o[P9_A], o[P9_B], o[P9_C],
+                o[P9_U], o[P9_V], o[P9_W]);
     }
     void set_g92_offset(const Point9 &o) override {
         maybe_new_line();
-        forward("set_g92_offset", o[0], o[1], o[2], o[3], o[4], o[5],
-                o[6], o[7], o[8]);
+        forward("set_g92_offset", o[P9_X], o[P9_Y], o[P9_Z],
+                o[P9_A], o[P9_B], o[P9_C],
+                o[P9_U], o[P9_V], o[P9_W]);
     }
     void set_xy_rotation(double degrees) override {
         maybe_new_line();
@@ -286,9 +293,36 @@ static double ensure_inch(double length) {
 
 static Point9 ensure_inch(const Point9 &p) {
     if(!parse_state.metric) return p;
-    return {p[0] / 25.4, p[1] / 25.4, p[2] / 25.4,
-            p[3], p[4], p[5],
-            p[6] / 25.4, p[7] / 25.4, p[8] / 25.4};
+    return {p[P9_X] / 25.4, p[P9_Y] / 25.4, p[P9_Z] / 25.4,
+            p[P9_A], p[P9_B], p[P9_C],
+            p[P9_U] / 25.4, p[P9_V] / 25.4, p[P9_W] / 25.4};
+}
+
+// One point of a NURBS curve, fed through the canon. The curve's two
+// components land in the active plane and every other axis holds the position
+// the interpreter last reported; a plane that carries no NURBS feeds nothing,
+// as the three separate `if`s this replaces did. STRAIGHT_FEED is a canon
+// entry point and keeps its loose arguments, so this is where the nine are
+// assembled.
+static void nurbs_feed(int line_number, CANON_PLANE plane,
+                       double first, double second) {
+    const Point9 &p = parse_state.pos;
+    switch(plane) {
+    case CANON_PLANE::XY:
+        STRAIGHT_FEED(line_number, first, second, p[P9_Z], p[P9_A], p[P9_B], p[P9_C],
+                      p[P9_U], p[P9_V], p[P9_W]);
+        break;
+    case CANON_PLANE::YZ:
+        STRAIGHT_FEED(line_number, p[P9_X], first, second, p[P9_A], p[P9_B], p[P9_C],
+                      p[P9_U], p[P9_V], p[P9_W]);
+        break;
+    case CANON_PLANE::XZ:
+        STRAIGHT_FEED(line_number, second, p[P9_Y], first, p[P9_A], p[P9_B], p[P9_C],
+                      p[P9_U], p[P9_V], p[P9_W]);
+        break;
+    default:
+        break;
+    }
 }
 
 //das ist für die Vorschau
@@ -306,33 +340,14 @@ void NURBS_G5_FEED(int line_number, const std::vector<NURBS_CONTROL_POINT>& nurb
         //printf("P1 X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",P1.NURBS_X,P1.NURBS_Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
 
         //STRAIGHT_FEED(line_number, P1.X,P1.Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-        if(plane==CANON_PLANE::XY) {
-            //printf("XY (F: %s L: %d)\n",__FILE__,__LINE__);
-            STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
-            }
-        if(plane==CANON_PLANE::YZ) {
-            //printf("YZ (F: %s L: %d)\n",__FILE__,__LINE__);
-            STRAIGHT_FEED(line_number, parse_state.pos_x, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
-            }
-        if(plane==CANON_PLANE::XZ) {
-            //printf("XZ (F: %s L: %d)\n",__FILE__,__LINE__);
-            STRAIGHT_FEED(line_number, P1.NURBS_Y, parse_state.pos_y, P1.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
-            }
+        nurbs_feed(line_number, plane, P1.NURBS_X, P1.NURBS_Y);
         u = u + umax/div;
         }
     P1.NURBS_X = nurbs_control_points[n].NURBS_X;
     P1.NURBS_Y = nurbs_control_points[n].NURBS_Y;
     //printf("Pn X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",P1.X,P1.Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
     //STRAIGHT_FEED(line_number, P1.X,P1.Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-    if(plane==CANON_PLANE::XY) {
-        STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
-        }
-    if(plane==CANON_PLANE::YZ) {
-        STRAIGHT_FEED(line_number, parse_state.pos_x, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
-        }
-    if(plane==CANON_PLANE::XZ) {
-        STRAIGHT_FEED(line_number, P1.NURBS_Y, parse_state.pos_y, P1.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
-        }
+    nurbs_feed(line_number, plane, P1.NURBS_X, P1.NURBS_Y);
     knot_vector.clear();
 }
 
@@ -352,44 +367,20 @@ void NURBS_G6_FEED(int line_number, const std::vector<NURBS_G6_CONTROL_POINT>& n
     P1 = nurbs_G6_pointx(knot_vector[0],k,nurbs_control_points,knot_vector,A6);
     //printf("%.3d P1  X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",line_number,P1.NURBS_X,P1.NURBS_Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
     //STRAIGHT_FEED(line_number, P1.NURBS_X,P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-    if(plane==CANON_PLANE::XY) {
-		    STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-        }
-    if(plane==CANON_PLANE::YZ) {
-		    STRAIGHT_FEED(line_number, parse_state.pos_x, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-        }
-    if(plane==CANON_PLANE::XZ) {
-		    STRAIGHT_FEED(line_number, P1.NURBS_Y, parse_state.pos_y, P1.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-        }
+    nurbs_feed(line_number, plane, P1.NURBS_X, P1.NURBS_Y);
     u=0.1;
     while (u+umax/div < umax) {
         P1x = nurbs_G6_point_x(u+umax/div,k,nurbs_control_points,knot_vector);
         //printf("%.3d P1x X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",line_number,P1x.NURBS_X,P1x.NURBS_Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
         //STRAIGHT_FEED(line_number, P1x.NURBS_X,P1x.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-		if(plane==CANON_PLANE::XY) {
-			    STRAIGHT_FEED(line_number, P1x.NURBS_X, P1x.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-			}
-		if(plane==CANON_PLANE::YZ) {
-			STRAIGHT_FEED(line_number, parse_state.pos_x, P1x.NURBS_X, P1x.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-			}
-		if(plane==CANON_PLANE::XZ) {
-			STRAIGHT_FEED(line_number, P1x.NURBS_Y, parse_state.pos_y, P1x.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-			}
+		nurbs_feed(line_number, plane, P1x.NURBS_X, P1x.NURBS_Y);
 		u = u + umax/div;
     }
     A6 = nurbs_G6_Nmix_creator (umax,  k, n+1, knot_vector);
     P1 = nurbs_G6_pointx(umax,k,nurbs_control_points,knot_vector,A6);
     //printf("%.3d P1  X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",line_number,P1.NURBS_X,P1.NURBS_Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
     //STRAIGHT_FEED(line_number, P1.NURBS_X,P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-    if(plane==CANON_PLANE::XY) {
-        STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-    	}
-    if(plane==CANON_PLANE::YZ) {
-		STRAIGHT_FEED(line_number, parse_state.pos_x, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-    	}
-    if(plane==CANON_PLANE::XZ) {
-		STRAIGHT_FEED(line_number, P1.NURBS_Y, parse_state.pos_y, P1.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
-    	}
+    nurbs_feed(line_number, plane, P1.NURBS_X, P1.NURBS_Y);
     knot_vector.clear();
 	}
 
@@ -417,9 +408,7 @@ void STRAIGHT_FEED(int line_number,
                    double x, double y, double z,
                    double a, double b, double c,
                    double u, double v, double w) {
-    parse_state.pos_x=x; parse_state.pos_y=y; parse_state.pos_z=z;
-    parse_state.pos_a=a; parse_state.pos_b=b; parse_state.pos_c=c;
-    parse_state.pos_u=u; parse_state.pos_v=v; parse_state.pos_w=w;
+    parse_state.pos = {x, y, z, a, b, c, u, v, w};
     parse_state.canon->straight_feed(line_number,
             ensure_inch({x, y, z, a, b, c, u, v, w}));
 }
@@ -428,9 +417,7 @@ void STRAIGHT_TRAVERSE(int line_number,
                        double x, double y, double z,
                        double a, double b, double c,
                        double u, double v, double w) {
-    parse_state.pos_x=x; parse_state.pos_y=y; parse_state.pos_z=z;
-    parse_state.pos_a=a; parse_state.pos_b=b; parse_state.pos_c=c;
-    parse_state.pos_u=u; parse_state.pos_v=v; parse_state.pos_w=w;
+    parse_state.pos = {x, y, z, a, b, c, u, v, w};
     parse_state.canon->straight_traverse(line_number,
             ensure_inch({x, y, z, a, b, c, u, v, w}));
 }
@@ -600,9 +587,7 @@ void STRAIGHT_PROBE(int line_number,
                     double x, double y, double z,
                     double a, double b, double c,
                     double u, double v, double w, unsigned char /*probe_type*/) {
-    parse_state.pos_x=x; parse_state.pos_y=y; parse_state.pos_z=z;
-    parse_state.pos_a=a; parse_state.pos_b=b; parse_state.pos_c=c;
-    parse_state.pos_u=u; parse_state.pos_v=v; parse_state.pos_w=w;
+    parse_state.pos = {x, y, z, a, b, c, u, v, w};
     parse_state.canon->straight_probe(line_number,
             ensure_inch({x, y, z, a, b, c, u, v, w}));
 }
@@ -614,26 +599,26 @@ void RIGID_TAP(int line_number,
 }
 double GET_EXTERNAL_MOTION_CONTROL_TOLERANCE() { return 0.1; }
 double GET_EXTERNAL_MOTION_CONTROL_NAIVECAM_TOLERANCE() { return 0.1; }
-double GET_EXTERNAL_PROBE_POSITION_X() { return parse_state.pos_x; }
-double GET_EXTERNAL_PROBE_POSITION_Y() { return parse_state.pos_y; }
-double GET_EXTERNAL_PROBE_POSITION_Z() { return parse_state.pos_z; }
-double GET_EXTERNAL_PROBE_POSITION_A() { return parse_state.pos_a; }
-double GET_EXTERNAL_PROBE_POSITION_B() { return parse_state.pos_b; }
-double GET_EXTERNAL_PROBE_POSITION_C() { return parse_state.pos_c; }
-double GET_EXTERNAL_PROBE_POSITION_U() { return parse_state.pos_u; }
-double GET_EXTERNAL_PROBE_POSITION_V() { return parse_state.pos_v; }
-double GET_EXTERNAL_PROBE_POSITION_W() { return parse_state.pos_w; }
+double GET_EXTERNAL_PROBE_POSITION_X() { return parse_state.pos[P9_X]; }
+double GET_EXTERNAL_PROBE_POSITION_Y() { return parse_state.pos[P9_Y]; }
+double GET_EXTERNAL_PROBE_POSITION_Z() { return parse_state.pos[P9_Z]; }
+double GET_EXTERNAL_PROBE_POSITION_A() { return parse_state.pos[P9_A]; }
+double GET_EXTERNAL_PROBE_POSITION_B() { return parse_state.pos[P9_B]; }
+double GET_EXTERNAL_PROBE_POSITION_C() { return parse_state.pos[P9_C]; }
+double GET_EXTERNAL_PROBE_POSITION_U() { return parse_state.pos[P9_U]; }
+double GET_EXTERNAL_PROBE_POSITION_V() { return parse_state.pos[P9_V]; }
+double GET_EXTERNAL_PROBE_POSITION_W() { return parse_state.pos[P9_W]; }
 double GET_EXTERNAL_PROBE_VALUE() { return 0.0; }
 int GET_EXTERNAL_PROBE_TRIPPED_VALUE() { return 0; }
-double GET_EXTERNAL_POSITION_X() { return parse_state.pos_x; }
-double GET_EXTERNAL_POSITION_Y() { return parse_state.pos_y; }
-double GET_EXTERNAL_POSITION_Z() { return parse_state.pos_z; }
-double GET_EXTERNAL_POSITION_A() { return parse_state.pos_a; }
-double GET_EXTERNAL_POSITION_B() { return parse_state.pos_b; }
-double GET_EXTERNAL_POSITION_C() { return parse_state.pos_c; }
-double GET_EXTERNAL_POSITION_U() { return parse_state.pos_u; }
-double GET_EXTERNAL_POSITION_V() { return parse_state.pos_v; }
-double GET_EXTERNAL_POSITION_W() { return parse_state.pos_w; }
+double GET_EXTERNAL_POSITION_X() { return parse_state.pos[P9_X]; }
+double GET_EXTERNAL_POSITION_Y() { return parse_state.pos[P9_Y]; }
+double GET_EXTERNAL_POSITION_Z() { return parse_state.pos[P9_Z]; }
+double GET_EXTERNAL_POSITION_A() { return parse_state.pos[P9_A]; }
+double GET_EXTERNAL_POSITION_B() { return parse_state.pos[P9_B]; }
+double GET_EXTERNAL_POSITION_C() { return parse_state.pos[P9_C]; }
+double GET_EXTERNAL_POSITION_U() { return parse_state.pos[P9_U]; }
+double GET_EXTERNAL_POSITION_V() { return parse_state.pos[P9_V]; }
+double GET_EXTERNAL_POSITION_W() { return parse_state.pos[P9_W]; }
 void INIT_CANON() {}
 
 void SET_PARAMETER_FILE_NAME(const char *name)
@@ -883,9 +868,7 @@ static py::object parse_file(const char *f, py::handle canon,
     parse_state.metric = false;
     parse_state.last_sequence_number = -1;
 
-    parse_state.pos_x = parse_state.pos_y = parse_state.pos_z = 0;
-    parse_state.pos_a = parse_state.pos_b = parse_state.pos_c = 0;
-    parse_state.pos_u = parse_state.pos_v = parse_state.pos_w = 0;
+    parse_state.pos = {};
 
     parse_state.pinterp->init();
     parse_state.pinterp->open(f);
