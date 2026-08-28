@@ -1,5 +1,5 @@
 //    This is a component of AXIS, a front-end for emc
-//    Copyright 2004, 2005, 2006 Jeff Epler <jepler@unpythonic.net> and 
+//    Copyright 2004, 2005, 2006 Jeff Epler <jepler@unpythonic.net> and
 //    Chris Radek <chris@timeguy.com>
 //
 //    This program is free software; you can redistribute it and/or modify
@@ -26,7 +26,7 @@
   The publications can be found at: http://wiki.linuxcnc.org/cgi-bin/wiki.pl?NURBS
   AMST08_art837759.pdf and ECME14.pdf
 
-  1: 
+  1:
   M. Leto, R. Licari, E. Lo Valvo1 , M. Piacentini:
   CAD/CAM INTEGRATION FOR NURBS PATH INTERPOLATION ON PC BASED REAL-TIME NUMERICAL CONTROL
   Proceedings of AMST 2008 Conference, 2008, pp. 223-233
@@ -51,6 +51,7 @@
 #include "nml_intf/interp_return.hh"
 #include "nml_intf/canon.hh"
 
+#include "gcodemodule.hh"
 #include "gcode_renderer.hh"
 
 int _task = 0; // control preview behaviour when remapping
@@ -118,48 +119,31 @@ static void linecode_register(py::module_ &m) {
             return int_array(l.mcodes, ACTIVE_M_CODES); });
 }
 
-PyObject *callback;
-int interp_error;
-int last_sequence_number;
-static int selected_tool = 0;
-static bool metric;
-static double _pos_x, _pos_y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w;
-EmcPose tool_offset;
+ParseState parse_state;
 
-static InterpBase *pinterp;
-
-// The `next_line` delivery guard, split off from last_sequence_number: a
-// rendered move advances that one (parse_file returns it, and error reporting
-// reads it) without a next_line having been delivered, so a still-forwarded
-// callback later on the same line must not be mistaken for a repeat. The two
-// move in lockstep on the callback protocol, where nothing but delivery
-// touches either.
-static int last_delivered_sequence_number;
+int ParseState::current_line() const {
+    return pinterp ? pinterp->sequence_number() : last_sequence_number;
+}
 
 static void maybe_new_line(int sequence_number);
 static void maybe_new_line();
 
-// The line number for a rendered event whose canon function is not given one.
-static int renderer_line_number() {
-    return pinterp ? pinterp->sequence_number() : last_sequence_number;
-}
-
 // Deliver next_line to the canon, at most once per source line.
 static void deliver_new_line(int sequence_number) {
-    if(!pinterp) return;
-    if(interp_error) return;
-    if(sequence_number == last_delivered_sequence_number)
+    if(!parse_state.pinterp) return;
+    if(parse_state.interp_error) return;
+    if(sequence_number == parse_state.last_delivered_sequence_number)
         return;
     auto line = std::make_unique<LineCode>();
-    pinterp->active_settings(line->settings);
-    pinterp->active_g_codes(line->gcodes);
-    pinterp->active_m_codes(line->mcodes);
+    parse_state.pinterp->active_settings(line->settings);
+    parse_state.pinterp->active_g_codes(line->gcodes);
+    parse_state.pinterp->active_m_codes(line->mcodes);
     line->gcodes[0] = sequence_number;
-    last_sequence_number = sequence_number;
-    last_delivered_sequence_number = sequence_number;
+    parse_state.last_sequence_number = sequence_number;
+    parse_state.last_delivered_sequence_number = sequence_number;
     // The cast is inside the guard too: it is the one step here that can raise.
     canon_guard([&]{
-        py::handle(callback).attr("next_line")(py::cast(std::move(line)));
+        py::handle(parse_state.callback).attr("next_line")(py::cast(std::move(line)));
     });
 }
 
@@ -170,14 +154,131 @@ static void maybe_new_line(int sequence_number) {
     // counts now that a rendered move delivers no next_line. In renderer mode
     // very little still forwards, so the periodic report in the parse loop is
     // what actually bounds how stale a progress bar gets.
-    GCodeRenderer::progress();
+    parse_state.canon->progress();
     deliver_new_line(sequence_number);
 }
 
 static void maybe_new_line() {
-    if(!pinterp) return;
-    maybe_new_line(pinterp->sequence_number());
+    if(!parse_state.pinterp) return;
+    maybe_new_line(parse_state.pinterp->sequence_number());
 }
+
+// An exact type check, not py::cast: these two reject an int where a float is
+// wanted, and the message is the one callers have always seen.
+static double exact_float(const char *func, py::handle p) {
+    if(!PyFloat_Check(p.ptr()))
+        throw py::type_error(std::string(func) + ": Expected float, got "
+                             + Py_TYPE(p.ptr())->tp_name);
+    return PyFloat_AS_DOUBLE(p.ptr());
+}
+
+double read_external_length_units() {
+    double dresult = 0.03937007874016;
+    canon_guard([&]{
+        dresult = exact_float("get_external_length_units",
+                py::handle(parse_state.callback).attr("get_external_length_units")());
+    });
+    return dresult;
+}
+
+double read_external_angle_units() {
+    double dresult = 1.0;
+    canon_guard([&]{
+        // Note the mismatch, kept: the method is `angular`, the message says
+        // `angle`.
+        dresult = exact_float("get_external_angle_units",
+                py::handle(parse_state.callback).attr("get_external_angular_units")());
+    });
+    return dresult;
+}
+
+// The per-event callback protocol: each canon event becomes one Python call,
+// preceded by at most one next_line per source line - byte-for-byte the
+// sequence this module has always produced.
+class CallbackCanon final : public Canon {
+public:
+    void arc_feed(int line_number, double first_end, double second_end,
+                  double first_axis, double second_axis, int rotation,
+                  double axis_end_point, double a, double b, double c,
+                  double u, double v, double w) override {
+        maybe_new_line(line_number);
+        forward("arc_feed", first_end, second_end, first_axis, second_axis,
+                rotation, axis_end_point, a, b, c, u, v, w);
+    }
+    void straight_feed(int line_number, double x, double y, double z,
+                       double a, double b, double c,
+                       double u, double v, double w) override {
+        maybe_new_line(line_number);
+        forward("straight_feed", x, y, z, a, b, c, u, v, w);
+    }
+    void straight_traverse(int line_number, double x, double y, double z,
+                           double a, double b, double c,
+                           double u, double v, double w) override {
+        maybe_new_line(line_number);
+        forward("straight_traverse", x, y, z, a, b, c, u, v, w);
+    }
+    void straight_probe(int line_number, double x, double y, double z,
+                        double a, double b, double c,
+                        double u, double v, double w) override {
+        maybe_new_line(line_number);
+        forward("straight_probe", x, y, z, a, b, c, u, v, w);
+    }
+    void rigid_tap(int line_number, double x, double y, double z) override {
+        maybe_new_line(line_number);
+        forward("rigid_tap", x, y, z);
+    }
+    void dwell(double seconds) override {
+        maybe_new_line();
+        forward("dwell", seconds);
+    }
+    void user_defined_function(int num, double arg1, double arg2) override {
+        maybe_new_line();
+        forward("user_defined_function", num, arg1, arg2);
+    }
+    void change_tool(int tool) override {
+        maybe_new_line();
+        forward("change_tool", tool);
+    }
+    void tool_offset(const Point9 &o) override {
+        maybe_new_line();
+        forward("tool_offset", o[0], o[1], o[2], o[3], o[4], o[5],
+                o[6], o[7], o[8]);
+    }
+    void set_g5x_offset(int index, const Point9 &o) override {
+        maybe_new_line();
+        forward("set_g5x_offset", index, o[0], o[1], o[2], o[3], o[4], o[5],
+                o[6], o[7], o[8]);
+    }
+    void set_g92_offset(const Point9 &o) override {
+        maybe_new_line();
+        forward("set_g92_offset", o[0], o[1], o[2], o[3], o[4], o[5],
+                o[6], o[7], o[8]);
+    }
+    void set_xy_rotation(double degrees) override {
+        maybe_new_line();
+        forward("set_xy_rotation", degrees);
+    }
+    void set_plane(int plane) override {
+        maybe_new_line();
+        forward("set_plane", plane);
+    }
+    void set_feed_rate(double rate) override {
+        maybe_new_line();
+        forward("set_feed_rate", rate);
+    }
+    void set_traverse_rate(double rate) override {
+        maybe_new_line();
+        forward("set_traverse_rate", rate);
+    }
+    // Asked every time, uncached: a canon on this protocol was going to be
+    // called per event anyway, and one may legitimately watch the traffic.
+    double external_length_units() override {
+        return read_external_length_units();
+    }
+    double external_angle_units() override {
+        return read_external_angle_units();
+    }
+};
 
 //das ist für die Vorschau
 /* G_5_2/G_5_3*/
@@ -187,39 +288,39 @@ void NURBS_G5_FEED(int line_number, const std::vector<NURBS_CONTROL_POINT>& nurb
     unsigned int n = nurbs_control_points.size() - 1;
     double umax = n - nurbs_order + 2;
     unsigned int div = nurbs_control_points.size()*15;
-    std::vector<unsigned int> knot_vector = nurbs_G5_knot_vector_creator(n, nurbs_order);	
+    std::vector<unsigned int> knot_vector = nurbs_G5_knot_vector_creator(n, nurbs_order);
     NURBS_PLANE_POINT P1;
     while (u+umax/div < umax) {
         NURBS_PLANE_POINT P1 = nurbs_G5_point(u+umax/div,nurbs_order,nurbs_control_points,knot_vector);
-        //printf("P1 X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",P1.NURBS_X,P1.NURBS_Y,_pos_x,_pos_y,_pos_z,__FILE__,__LINE__);
+        //printf("P1 X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",P1.NURBS_X,P1.NURBS_Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
 
-        //STRAIGHT_FEED(line_number, P1.X,P1.Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+        //STRAIGHT_FEED(line_number, P1.X,P1.Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
         if(plane==CANON_PLANE::XY) {
             //printf("XY (F: %s L: %d)\n",__FILE__,__LINE__);
-            STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w); //
+            STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
             }
         if(plane==CANON_PLANE::YZ) {
             //printf("YZ (F: %s L: %d)\n",__FILE__,__LINE__);
-            STRAIGHT_FEED(line_number, _pos_x, P1.NURBS_X, P1.NURBS_Y, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w); //
+            STRAIGHT_FEED(line_number, parse_state.pos_x, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
             }
         if(plane==CANON_PLANE::XZ) {
             //printf("XZ (F: %s L: %d)\n",__FILE__,__LINE__);
-            STRAIGHT_FEED(line_number, P1.NURBS_Y, _pos_y, P1.NURBS_X, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w); //
+            STRAIGHT_FEED(line_number, P1.NURBS_Y, parse_state.pos_y, P1.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
             }
         u = u + umax/div;
-        } 
+        }
     P1.NURBS_X = nurbs_control_points[n].NURBS_X;
     P1.NURBS_Y = nurbs_control_points[n].NURBS_Y;
-    //printf("Pn X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",P1.X,P1.Y,_pos_x,_pos_y,_pos_z,__FILE__,__LINE__);
-    //STRAIGHT_FEED(line_number, P1.X,P1.Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+    //printf("Pn X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",P1.X,P1.Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
+    //STRAIGHT_FEED(line_number, P1.X,P1.Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
     if(plane==CANON_PLANE::XY) {
-        STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w); //
+        STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
         }
     if(plane==CANON_PLANE::YZ) {
-        STRAIGHT_FEED(line_number, _pos_x, P1.NURBS_X, P1.NURBS_Y, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w); //
+        STRAIGHT_FEED(line_number, parse_state.pos_x, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
         }
     if(plane==CANON_PLANE::XZ) {
-        STRAIGHT_FEED(line_number, P1.NURBS_Y, _pos_y, P1.NURBS_X, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w); //
+        STRAIGHT_FEED(line_number, P1.NURBS_Y, parse_state.pos_y, P1.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w); //
         }
     knot_vector.clear();
 }
@@ -237,46 +338,46 @@ void NURBS_G6_FEED(int line_number, const std::vector<NURBS_G6_CONTROL_POINT>& n
     NURBS_PLANE_POINT P1x, P1;
     std::vector< std::vector<double> > A6;
     A6 = nurbs_G6_Nmix_creator(u+umax/div, k, n+1, knot_vector);
-    P1 = nurbs_G6_pointx(knot_vector[0],k,nurbs_control_points,knot_vector,A6);	
-    //printf("%.3d P1  X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",line_number,P1.NURBS_X,P1.NURBS_Y,_pos_x,_pos_y,_pos_z,__FILE__,__LINE__);
-    //STRAIGHT_FEED(line_number, P1.NURBS_X,P1.NURBS_Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+    P1 = nurbs_G6_pointx(knot_vector[0],k,nurbs_control_points,knot_vector,A6);
+    //printf("%.3d P1  X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",line_number,P1.NURBS_X,P1.NURBS_Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
+    //STRAIGHT_FEED(line_number, P1.NURBS_X,P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
     if(plane==CANON_PLANE::XY) {
-		    STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+		    STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
         }
     if(plane==CANON_PLANE::YZ) {
-		    STRAIGHT_FEED(line_number, _pos_x, P1.NURBS_X, P1.NURBS_Y, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+		    STRAIGHT_FEED(line_number, parse_state.pos_x, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
         }
     if(plane==CANON_PLANE::XZ) {
-		    STRAIGHT_FEED(line_number, P1.NURBS_Y, _pos_y, P1.NURBS_X, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+		    STRAIGHT_FEED(line_number, P1.NURBS_Y, parse_state.pos_y, P1.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
         }
     u=0.1;
     while (u+umax/div < umax) {
         P1x = nurbs_G6_point_x(u+umax/div,k,nurbs_control_points,knot_vector);
-        //printf("%.3d P1x X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",line_number,P1x.NURBS_X,P1x.NURBS_Y,_pos_x,_pos_y,_pos_z,__FILE__,__LINE__);
-        //STRAIGHT_FEED(line_number, P1x.NURBS_X,P1x.NURBS_Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+        //printf("%.3d P1x X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",line_number,P1x.NURBS_X,P1x.NURBS_Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
+        //STRAIGHT_FEED(line_number, P1x.NURBS_X,P1x.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
 		if(plane==CANON_PLANE::XY) {
-			    STRAIGHT_FEED(line_number, P1x.NURBS_X, P1x.NURBS_Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+			    STRAIGHT_FEED(line_number, P1x.NURBS_X, P1x.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
 			}
 		if(plane==CANON_PLANE::YZ) {
-			STRAIGHT_FEED(line_number, _pos_x, P1x.NURBS_X, P1x.NURBS_Y, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+			STRAIGHT_FEED(line_number, parse_state.pos_x, P1x.NURBS_X, P1x.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
 			}
 		if(plane==CANON_PLANE::XZ) {
-			STRAIGHT_FEED(line_number, P1x.NURBS_Y, _pos_y, P1x.NURBS_X, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+			STRAIGHT_FEED(line_number, P1x.NURBS_Y, parse_state.pos_y, P1x.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
 			}
 		u = u + umax/div;
-    } 
+    }
     A6 = nurbs_G6_Nmix_creator (umax,  k, n+1, knot_vector);
-    P1 = nurbs_G6_pointx(umax,k,nurbs_control_points,knot_vector,A6);	
-    //printf("%.3d P1  X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",line_number,P1.NURBS_X,P1.NURBS_Y,_pos_x,_pos_y,_pos_z,__FILE__,__LINE__);
-    //STRAIGHT_FEED(line_number, P1.NURBS_X,P1.NURBS_Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+    P1 = nurbs_G6_pointx(umax,k,nurbs_control_points,knot_vector,A6);
+    //printf("%.3d P1  X: %8.4f Y: %8.4f pos_x: %8.4f pos_y: %8.4f pos_z: %8.4f (F: %s L: %d)\n",line_number,P1.NURBS_X,P1.NURBS_Y,parse_state.pos_x,parse_state.pos_y,parse_state.pos_z,__FILE__,__LINE__);
+    //STRAIGHT_FEED(line_number, P1.NURBS_X,P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
     if(plane==CANON_PLANE::XY) {
-        STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, _pos_z, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+        STRAIGHT_FEED(line_number, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_z, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
     	}
     if(plane==CANON_PLANE::YZ) {
-		STRAIGHT_FEED(line_number, _pos_x, P1.NURBS_X, P1.NURBS_Y, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+		STRAIGHT_FEED(line_number, parse_state.pos_x, P1.NURBS_X, P1.NURBS_Y, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
     	}
     if(plane==CANON_PLANE::XZ) {
-		STRAIGHT_FEED(line_number, P1.NURBS_Y, _pos_y, P1.NURBS_X, _pos_a, _pos_b, _pos_c, _pos_u, _pos_v, _pos_w);
+		STRAIGHT_FEED(line_number, P1.NURBS_Y, parse_state.pos_y, P1.NURBS_X, parse_state.pos_a, parse_state.pos_b, parse_state.pos_c, parse_state.pos_u, parse_state.pos_v, parse_state.pos_w);
     	}
     knot_vector.clear();
 	}
@@ -288,7 +389,7 @@ void ARC_FEED(int line_number,
               double a_position, double b_position, double c_position,
               double u_position, double v_position, double w_position) {
     // XXX: set _pos_*
-    if(metric) {
+    if(parse_state.metric) {
         first_end /= 25.4;
         second_end /= 25.4;
         first_axis /= 25.4;
@@ -298,103 +399,61 @@ void ARC_FEED(int line_number,
         v_position /= 25.4;
         w_position /= 25.4;
     }
-    if(GCodeRenderer::active()) {
-        if(interp_error) return;
-        GCodeRenderer::arc(line_number, first_end, second_end, first_axis,
-                           second_axis, rotation, axis_end_point,
-                           a_position, b_position, c_position,
-                           u_position, v_position, w_position);
-        return;
-    }
-    maybe_new_line(line_number);
-    forward("arc_feed", first_end, second_end, first_axis, second_axis,
-            rotation, axis_end_point,
-            a_position, b_position, c_position,
-            u_position, v_position, w_position);
+    parse_state.canon->arc_feed(line_number, first_end, second_end, first_axis,
+                                second_axis, rotation, axis_end_point,
+                                a_position, b_position, c_position,
+                                u_position, v_position, w_position);
 }
 
 void STRAIGHT_FEED(int line_number,
                    double x, double y, double z,
                    double a, double b, double c,
                    double u, double v, double w) {
-    _pos_x=x; _pos_y=y; _pos_z=z; 
-    _pos_a=a; _pos_b=b; _pos_c=c;
-    _pos_u=u; _pos_v=v; _pos_w=w;
-    if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    if(GCodeRenderer::active()) {
-        if(interp_error) return;
-        GCodeRenderer::append(GCodeRenderer::Feed, line_number,
-                              x, y, z, a, b, c, u, v, w);
-        return;
-    }
-    maybe_new_line(line_number);
-    forward("straight_feed", x, y, z, a, b, c, u, v, w);
+    parse_state.pos_x=x; parse_state.pos_y=y; parse_state.pos_z=z;
+    parse_state.pos_a=a; parse_state.pos_b=b; parse_state.pos_c=c;
+    parse_state.pos_u=u; parse_state.pos_v=v; parse_state.pos_w=w;
+    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
+    parse_state.canon->straight_feed(line_number, x, y, z, a, b, c, u, v, w);
 }
 
 void STRAIGHT_TRAVERSE(int line_number,
                        double x, double y, double z,
                        double a, double b, double c,
                        double u, double v, double w) {
-    _pos_x=x; _pos_y=y; _pos_z=z; 
-    _pos_a=a; _pos_b=b; _pos_c=c;
-    _pos_u=u; _pos_v=v; _pos_w=w;
-    if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    if(GCodeRenderer::active()) {
-        if(interp_error) return;
-        GCodeRenderer::append(GCodeRenderer::Traverse, line_number,
-                              x, y, z, a, b, c, u, v, w);
-        return;
-    }
-    maybe_new_line(line_number);
-    forward("straight_traverse", x, y, z, a, b, c, u, v, w);
+    parse_state.pos_x=x; parse_state.pos_y=y; parse_state.pos_z=z;
+    parse_state.pos_a=a; parse_state.pos_b=b; parse_state.pos_c=c;
+    parse_state.pos_u=u; parse_state.pos_v=v; parse_state.pos_w=w;
+    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
+    parse_state.canon->straight_traverse(line_number, x, y, z, a, b, c, u, v, w);
 }
 
 void SET_G5X_OFFSET(int g5x_index,
                     double x, double y, double z,
                     double a, double b, double c,
                     double u, double v, double w) {
-    if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    const Point9 offsets = {x, y, z, a, b, c, u, v, w};
-    // The renderer transforms with its own copy, taken here, and never reads
-    // the canon's - so in renderer mode there is nothing to tell the canon.
-    if(GCodeRenderer::active()) { GCodeRenderer::set_g5x(offsets); return; }
-    maybe_new_line();
-    forward("set_g5x_offset", g5x_index, x, y, z, a, b, c, u, v, w);
+    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
+    parse_state.canon->set_g5x_offset(g5x_index, {x, y, z, a, b, c, u, v, w});
 }
 
 void SET_G92_OFFSET(double x, double y, double z,
                     double a, double b, double c,
                     double u, double v, double w) {
-    if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    const Point9 offsets = {x, y, z, a, b, c, u, v, w};
-    if(GCodeRenderer::active()) { GCodeRenderer::set_g92(offsets); return; }
-    maybe_new_line();
-    forward("set_g92_offset", x, y, z, a, b, c, u, v, w);
+    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
+    parse_state.canon->set_g92_offset({x, y, z, a, b, c, u, v, w});
 }
 
 void SET_XY_ROTATION(double t) {
-    if(GCodeRenderer::active()) { GCodeRenderer::set_rotation_xy(t); return; }
-    maybe_new_line();
-    forward("set_xy_rotation", t);
+    parse_state.canon->set_xy_rotation(t);
 };
 
-void USE_LENGTH_UNITS(CANON_UNITS u) { metric = u == CANON_UNITS_MM; }
+void USE_LENGTH_UNITS(CANON_UNITS u) { parse_state.metric = u == CANON_UNITS_MM; }
 
 void SELECT_PLANE(CANON_PLANE pl) {
-    GCodeRenderer::note_plane(static_cast<int>(pl));
-    // The plane reaches the record through note_plane and the arc segmenter;
-    // nothing on a rendered parse reads the canon's own copy.
-    if(GCodeRenderer::active()) return;
-    maybe_new_line();
-    forward("set_plane", static_cast<int>(pl));
+    parse_state.canon->set_plane(static_cast<int>(pl));
 }
 
 void SET_TRAVERSE_RATE(double rate) {
-    // A traverse carries no rate into the record - rapid_length is a length,
-    // not a time - so a rendered parse has nothing to say about this.
-    if(GCodeRenderer::active()) return;
-    maybe_new_line();
-    forward("set_traverse_rate", rate);
+    parse_state.canon->set_traverse_rate(rate);
 }
 
 void SET_FEED_MODE(int /*spindle*/, int /*mode*/) {
@@ -405,19 +464,12 @@ void SET_FEED_MODE(int /*spindle*/, int /*mode*/) {
 }
 
 void CHANGE_TOOL() {
-    if(GCodeRenderer::active()) {
-        if(interp_error) return;
-        GCodeRenderer::append(GCodeRenderer::ChangeTool, renderer_line_number(),
-                     selected_tool, 0, 0, 0, 0, 0, 0, 0, 0);
-        return;
-    }
-    maybe_new_line();
-    forward("change_tool", selected_tool);
+    parse_state.canon->change_tool(parse_state.selected_tool);
 }
 
 void CHANGE_TOOL_NUMBER(int /*pocket*/) {
     maybe_new_line();
-    if(interp_error) return;
+    if(parse_state.interp_error) return;
 }
 
 void RELOAD_TOOLDATA(void) {
@@ -430,34 +482,12 @@ void RELOAD_TOOLDATA(void) {
  * time feed wrong anyway..
  */
 void SET_FEED_RATE(double rate) {
-    if(metric) rate /= 25.4;
-    if(GCodeRenderer::active()) {
-        // The rate reaches the program in every move's own length table, so
-        // there is nothing left for the canon to be told - and telling it is
-        // not cheap: the interpreter reports an F word whether or not it
-        // changed anything (interp_execute.cc branches on `block->f_flag`
-        // alone), so CAM output with adaptive feed lands here once per move.
-        //
-        // Arcs are unaffected: the renderer segments an arc with the rate
-        // current at the time, which is this one.
-        GCodeRenderer::feed_rate(rate);
-        return;
-    }
-    maybe_new_line();
-    forward("set_feed_rate", rate);
+    if(parse_state.metric) rate /= 25.4;
+    parse_state.canon->set_feed_rate(rate);
 }
 
 void DWELL(double time) {
-    if(GCodeRenderer::active()) {
-        if(interp_error) return;
-        // Rendered like any other event, and not a progress report of its
-        // own: a G81/G82 cycle emits one of these per hole.
-        GCodeRenderer::append(GCodeRenderer::Dwell, renderer_line_number(),
-                     time, 0, 0, 0, 0, 0, 0, 0, 0);
-        return;
-    }
-    maybe_new_line();
-    forward("dwell", time);
+    parse_state.canon->dwell(time);
 }
 
 void MESSAGE(char *comment) {
@@ -473,8 +503,8 @@ void LOGCLOSE() {}
 void COMMENT(const char *comment) {
     maybe_new_line();
     forward("comment", comment);
-    if(interp_error) return;
-    GCodeRenderer::comment(comment);
+    if(parse_state.interp_error) return;
+    parse_state.canon->comment(comment);
 }
 
 void SET_TOOL_TABLE_ENTRY(int /*pocket*/, int /*toolno*/, const EmcPose& /*offset*/, double /*diameter*/,
@@ -482,29 +512,12 @@ void SET_TOOL_TABLE_ENTRY(int /*pocket*/, int /*toolno*/, const EmcPose& /*offse
 }
 
 void USE_TOOL_LENGTH_OFFSET(const EmcPose& offset) {
-    tool_offset = offset;
-    if(GCodeRenderer::active()) {
-        if(interp_error) return;
-        if(metric) {
-            GCodeRenderer::append(GCodeRenderer::ToolOffset, renderer_line_number(),
-                    offset.tran.x / 25.4, offset.tran.y / 25.4,
-                    offset.tran.z / 25.4,
-                    offset.a, offset.b, offset.c,
-                    offset.u / 25.4, offset.v / 25.4, offset.w / 25.4);
-        } else {
-            GCodeRenderer::append(GCodeRenderer::ToolOffset, renderer_line_number(),
-                    offset.tran.x, offset.tran.y, offset.tran.z,
-                    offset.a, offset.b, offset.c,
-                    offset.u, offset.v, offset.w);
-        }
-        return;
-    }
-    maybe_new_line();
-    const double scale = metric ? 25.4 : 1.0;
-    forward("tool_offset",
+    parse_state.tool_offset = offset;
+    const double scale = parse_state.metric ? 25.4 : 1.0;
+    parse_state.canon->tool_offset({
             offset.tran.x / scale, offset.tran.y / scale, offset.tran.z / scale,
             offset.a, offset.b, offset.c,
-            offset.u / scale, offset.v / scale, offset.w / scale);
+            offset.u / scale, offset.v / scale, offset.w / scale});
 }
 
 void SET_FEED_REFERENCE(double /*reference*/) { }
@@ -519,7 +532,7 @@ void START_SPINDLE_CLOCKWISE(int /*spindle*/, int /*wait_for_at_speed*/) {}
 void SET_SPINDLE_MODE(int /*spindle*/, double) {}
 void STOP_SPINDLE_TURNING(int /*spindle*/, int /*wait_for_at_speed*/) {}
 void SET_SPINDLE_SPEED(int spindle, double rpm) {
-    if(spindle == 0) GCodeRenderer::spindle_speed(rpm);
+    if(spindle == 0) parse_state.canon->set_spindle_speed(rpm);
 }
 void ORIENT_SPINDLE(int /*spindle*/, double /*d*/, int /*i*/) {}
 void WAIT_SPINDLE_ORIENT_COMPLETE(int /*s*/, double /*timeout*/) {}
@@ -528,7 +541,7 @@ void PROGRAM_END() {}
 void FINISH() {}
 void ON_RESET() {}
 void PALLET_SHUTTLE() {}
-void SELECT_TOOL(int tool) {selected_tool = tool;}
+void SELECT_TOOL(int tool) {parse_state.selected_tool = tool;}
 void UPDATE_TAG(const StateTag& /*tag*/) {}
 void OPTIONAL_PROGRAM_STOP() {}
 int  GET_EXTERNAL_TC_FAULT() {return 0;}
@@ -540,7 +553,7 @@ extern bool GET_BLOCK_DELETE(void) {
     canon_guard([&]{
         // PyObject_IsTrue, not a bool cast: any object the canon returns
         // answers this, as it always has.
-        bd = PyObject_IsTrue(py::handle(callback).attr("get_block_delete")().ptr());
+        bd = PyObject_IsTrue(py::handle(parse_state.callback).attr("get_block_delete")().ptr());
     });
     return bd;
 }
@@ -577,60 +590,43 @@ int UNLOCK_ROTARY(int /*line_no*/, int /*joint_num*/) {return 0;}
 int LOCK_ROTARY(int /*line_no*/, int /*joint_num*/) {return 0;}
 void INTERP_ABORT(int /*reason*/, const char * /*message*/) {}
 
-void STRAIGHT_PROBE(int line_number, 
-                    double x, double y, double z, 
+void STRAIGHT_PROBE(int line_number,
+                    double x, double y, double z,
                     double a, double b, double c,
                     double u, double v, double w, unsigned char /*probe_type*/) {
-    _pos_x=x; _pos_y=y; _pos_z=z; 
-    _pos_a=a; _pos_b=b; _pos_c=c;
-    _pos_u=u; _pos_v=v; _pos_w=w;
-    if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    if(GCodeRenderer::active()) {
-        if(interp_error) return;
-        GCodeRenderer::append(GCodeRenderer::Probe, line_number,
-                              x, y, z, a, b, c, u, v, w);
-        return;
-    }
-    maybe_new_line(line_number);
-    forward("straight_probe", x, y, z, a, b, c, u, v, w);
-
+    parse_state.pos_x=x; parse_state.pos_y=y; parse_state.pos_z=z;
+    parse_state.pos_a=a; parse_state.pos_b=b; parse_state.pos_c=c;
+    parse_state.pos_u=u; parse_state.pos_v=v; parse_state.pos_w=w;
+    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
+    parse_state.canon->straight_probe(line_number, x, y, z, a, b, c, u, v, w);
 }
 void RIGID_TAP(int line_number,
                double x, double y, double z, double /*scale*/) {
-    if(metric) { x /= 25.4; y /= 25.4; z /= 25.4; }
-    if(GCodeRenderer::active()) {
-        if(interp_error) return;
-        // a..w are zero, exactly the arguments the `rigid_tap` callback does
-        // not have; the renderer joins x,y,z to the chain point's a..w.
-        GCodeRenderer::append(GCodeRenderer::RigidTap, line_number,
-                              x, y, z, 0, 0, 0, 0, 0, 0);
-        return;
-    }
-    maybe_new_line(line_number);
-    forward("rigid_tap", x, y, z);
+    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; }
+    parse_state.canon->rigid_tap(line_number, x, y, z);
 }
 double GET_EXTERNAL_MOTION_CONTROL_TOLERANCE() { return 0.1; }
 double GET_EXTERNAL_MOTION_CONTROL_NAIVECAM_TOLERANCE() { return 0.1; }
-double GET_EXTERNAL_PROBE_POSITION_X() { return _pos_x; }
-double GET_EXTERNAL_PROBE_POSITION_Y() { return _pos_y; }
-double GET_EXTERNAL_PROBE_POSITION_Z() { return _pos_z; }
-double GET_EXTERNAL_PROBE_POSITION_A() { return _pos_a; }
-double GET_EXTERNAL_PROBE_POSITION_B() { return _pos_b; }
-double GET_EXTERNAL_PROBE_POSITION_C() { return _pos_c; }
-double GET_EXTERNAL_PROBE_POSITION_U() { return _pos_u; }
-double GET_EXTERNAL_PROBE_POSITION_V() { return _pos_v; }
-double GET_EXTERNAL_PROBE_POSITION_W() { return _pos_w; }
+double GET_EXTERNAL_PROBE_POSITION_X() { return parse_state.pos_x; }
+double GET_EXTERNAL_PROBE_POSITION_Y() { return parse_state.pos_y; }
+double GET_EXTERNAL_PROBE_POSITION_Z() { return parse_state.pos_z; }
+double GET_EXTERNAL_PROBE_POSITION_A() { return parse_state.pos_a; }
+double GET_EXTERNAL_PROBE_POSITION_B() { return parse_state.pos_b; }
+double GET_EXTERNAL_PROBE_POSITION_C() { return parse_state.pos_c; }
+double GET_EXTERNAL_PROBE_POSITION_U() { return parse_state.pos_u; }
+double GET_EXTERNAL_PROBE_POSITION_V() { return parse_state.pos_v; }
+double GET_EXTERNAL_PROBE_POSITION_W() { return parse_state.pos_w; }
 double GET_EXTERNAL_PROBE_VALUE() { return 0.0; }
 int GET_EXTERNAL_PROBE_TRIPPED_VALUE() { return 0; }
-double GET_EXTERNAL_POSITION_X() { return _pos_x; }
-double GET_EXTERNAL_POSITION_Y() { return _pos_y; }
-double GET_EXTERNAL_POSITION_Z() { return _pos_z; }
-double GET_EXTERNAL_POSITION_A() { return _pos_a; }
-double GET_EXTERNAL_POSITION_B() { return _pos_b; }
-double GET_EXTERNAL_POSITION_C() { return _pos_c; }
-double GET_EXTERNAL_POSITION_U() { return _pos_u; }
-double GET_EXTERNAL_POSITION_V() { return _pos_v; }
-double GET_EXTERNAL_POSITION_W() { return _pos_w; }
+double GET_EXTERNAL_POSITION_X() { return parse_state.pos_x; }
+double GET_EXTERNAL_POSITION_Y() { return parse_state.pos_y; }
+double GET_EXTERNAL_POSITION_Z() { return parse_state.pos_z; }
+double GET_EXTERNAL_POSITION_A() { return parse_state.pos_a; }
+double GET_EXTERNAL_POSITION_B() { return parse_state.pos_b; }
+double GET_EXTERNAL_POSITION_C() { return parse_state.pos_c; }
+double GET_EXTERNAL_POSITION_U() { return parse_state.pos_u; }
+double GET_EXTERNAL_POSITION_V() { return parse_state.pos_v; }
+double GET_EXTERNAL_POSITION_W() { return parse_state.pos_w; }
 void INIT_CANON() {}
 
 void SET_PARAMETER_FILE_NAME(const char *name)
@@ -644,7 +640,7 @@ void GET_EXTERNAL_PARAMETER_FILE_NAME(char *name, int max_size) {
     // always just left the name empty, with the error still on the indicator.
     try {
         std::string file = py::cast<std::string>(
-                py::handle(callback).attr("parameter_file"));
+                py::handle(parse_state.callback).attr("parameter_file"));
         memset(name, 0, max_size);
         strncpy(name, file.c_str(), max_size - 1);
     } catch(py::error_already_set &e) {
@@ -655,7 +651,7 @@ CANON_UNITS GET_EXTERNAL_LENGTH_UNIT_TYPE() { return CANON_UNITS_INCHES; }
 CANON_TOOL_TABLE GET_EXTERNAL_TOOL_TABLE(int pocket) {
     CANON_TOOL_TABLE tdata = {-1,-1,{{0,0,0},0,0,0,0,0,0},0,0,0,0,{}};
     canon_guard([&]{
-        py::object result = py::handle(callback).attr("get_tool")(pocket);
+        py::object result = py::handle(parse_state.callback).attr("get_tool")(pocket);
         if(!PyTuple_Check(result.ptr()) || PyTuple_GET_SIZE(result.ptr()) != 14)
             throw py::type_error("get_tool: expected a tuple of 14 items");
         py::tuple t = py::reinterpret_borrow<py::tuple>(result);
@@ -686,14 +682,8 @@ double GET_EXTERNAL_ANALOG_INPUT(int /*index*/, double def) { return def; }
 int WAIT(int /*index*/, int /*input_type*/, int /*wait_type*/, double /*timeout*/) { return 0;}
 
 static void user_defined_function(int num, double arg1, double arg2) {
-    if(interp_error) return;
-    if(GCodeRenderer::active()) {
-        GCodeRenderer::append(GCodeRenderer::M1xx, renderer_line_number(),
-                     num, arg1, arg2, 0, 0, 0, 0, 0, 0);
-        return;
-    }
-    maybe_new_line();
-    forward("user_defined_function", num, arg1, arg2);
+    if(parse_state.interp_error) return;
+    parse_state.canon->user_defined_function(num, arg1, arg2);
 }
 
 void SET_FEED_REFERENCE(CANON_FEED_REFERENCE /*ref*/) {}
@@ -707,8 +697,8 @@ int GET_EXTERNAL_FLOOD() { return 0; }
 int GET_EXTERNAL_MIST() { return 0; }
 CANON_PLANE GET_EXTERNAL_PLANE() { return CANON_PLANE::XY; }
 double GET_EXTERNAL_SPEED(int /*spindle*/) { return 0; }
-void DISABLE_ADAPTIVE_FEED() {} 
-void ENABLE_ADAPTIVE_FEED() {} 
+void DISABLE_ADAPTIVE_FEED() {}
+void ENABLE_ADAPTIVE_FEED() {}
 
 int GET_EXTERNAL_FEED_OVERRIDE_ENABLE() {return 1;}
 int GET_EXTERNAL_SPINDLE_OVERRIDE_ENABLE(int /*spindle*/) {return 1;}
@@ -733,90 +723,52 @@ EmcPose GET_EXTERNAL_OFFSETS() {
 int GET_EXTERNAL_AXIS_MASK() {
     int mask = 7;                                       /* XYZABC */
     canon_guard([&]{
-        py::object result = py::handle(callback).attr("get_axis_mask")();
-        if(!PyLong_Check(result.ptr())) { interp_error ++; return; }
+        py::object result = py::handle(parse_state.callback).attr("get_axis_mask")();
+        if(!PyLong_Check(result.ptr())) { parse_state.interp_error ++; return; }
         mask = (int)PyLong_AsLong(result.ptr());
     });
     return mask;
 }
 
 double GET_EXTERNAL_TOOL_LENGTH_XOFFSET() {
-    return tool_offset.tran.x;
+    return parse_state.tool_offset.tran.x;
 }
 double GET_EXTERNAL_TOOL_LENGTH_YOFFSET() {
-    return tool_offset.tran.y;
+    return parse_state.tool_offset.tran.y;
 }
 double GET_EXTERNAL_TOOL_LENGTH_ZOFFSET() {
-    return tool_offset.tran.z;
+    return parse_state.tool_offset.tran.z;
 }
 double GET_EXTERNAL_TOOL_LENGTH_AOFFSET() {
-    return tool_offset.a;
+    return parse_state.tool_offset.a;
 }
 double GET_EXTERNAL_TOOL_LENGTH_BOFFSET() {
-    return tool_offset.b;
+    return parse_state.tool_offset.b;
 }
 double GET_EXTERNAL_TOOL_LENGTH_COFFSET() {
-    return tool_offset.c;
+    return parse_state.tool_offset.c;
 }
 double GET_EXTERNAL_TOOL_LENGTH_UOFFSET() {
-    return tool_offset.u;
+    return parse_state.tool_offset.u;
 }
 double GET_EXTERNAL_TOOL_LENGTH_VOFFSET() {
-    return tool_offset.v;
+    return parse_state.tool_offset.v;
 }
 double GET_EXTERNAL_TOOL_LENGTH_WOFFSET() {
-    return tool_offset.w;
+    return parse_state.tool_offset.w;
 }
 
-// An exact type check, not py::cast: these two reject an int where a float is
-// wanted, and the message is the one callers have always seen.
-static double exact_float(const char *func, py::handle p) {
-    if(!PyFloat_Check(p.ptr()))
-        throw py::type_error(std::string(func) + ": Expected float, got "
-                             + Py_TYPE(p.ptr())->tp_name);
-    return PyFloat_AS_DOUBLE(p.ptr());
-}
-
-// The machine's unit scales. Both are constants for the whole parse, and both
-// are asked for repeatedly: arc_segments() wants the length units once per arc
-// for its small-arc test, which in renderer mode is once per arc *rendered* -
-// thousands of Python calls for a number that cannot move. On the callback
-// protocol they are left alone, because there the canon was going to be called
-// per event anyway and a canon may legitimately watch the traffic. Cached only
-// while a renderer is armed; parse_file drops both at the start of a parse.
-static double length_units_ = 0.0;
-static bool length_units_known = false;
-static double angle_units_ = 0.0;
-static bool angle_units_known = false;
-
+// The unit constants, answered by the parse's protocol: the callback protocol
+// asks the canon every time, the renderer caches. Before any parse there is
+// no protocol yet; answer the defaults a failed read has always answered.
 double GET_EXTERNAL_ANGLE_UNITS() {
-    if(angle_units_known) return angle_units_;
-    double dresult = 1.0;
-    canon_guard([&]{
-        // Note the mismatch, kept: the method is `angular`, the message says
-        // `angle`.
-        dresult = exact_float("get_external_angle_units",
-                py::handle(callback).attr("get_external_angular_units")());
-    });
-    if(GCodeRenderer::active() && !interp_error) {
-        angle_units_ = dresult;
-        angle_units_known = true;
-    }
-    return dresult;
+    if(!parse_state.canon) return 1.0;
+    return parse_state.canon->external_angle_units();
 }
 
 double GET_EXTERNAL_LENGTH_UNITS() {
-    if(length_units_known) return length_units_;
-    double dresult = 0.03937007874016;
-    canon_guard([&]{
-        dresult = exact_float("get_external_length_units",
-                py::handle(callback).attr("get_external_length_units")());
-    });
-    if(GCodeRenderer::active() && !interp_error) {
-        length_units_ = dresult;
-        length_units_known = true;
-    }
-    return dresult;
+    if(!parse_state.canon) return 0.03937007874016; // 1/25.4
+    return parse_state.canon->external_length_units();
 }
 
 // True to stop the parse. A failed call aborts it too, and - unlike the
@@ -824,7 +776,7 @@ double GET_EXTERNAL_LENGTH_UNITS() {
 // answer alone, carrying whatever exception is set.
 static bool check_abort() {
     try {
-        py::object result = py::handle(callback).attr("check_abort")();
+        py::object result = py::handle(parse_state.callback).attr("check_abort")();
         if(PyObject_IsTrue(result.ptr())) {
             PyErr_Format(PyExc_KeyboardInterrupt, "Load aborted");
             return true;
@@ -884,44 +836,63 @@ static py::object parse_file(const char *f, py::handle canon,
     clock::time_point last;
     int result = INTERP_OK;
 
+    // gcode.parse has never been reentrant - a second entry deletes the
+    // interpreter the first parse is still executing and redirects its canon
+    // calls into the other canon. It can happen: check_abort() pumps AXIS's
+    // Tk event loop, which can get back here mid-parse. Refuse at the door;
+    // the per-entry ownership check this replaces could only catch the
+    // renderer half of the damage.
+    if(parse_state.in_parse)
+        throw std::runtime_error("gcode.parse is not reentrant: "
+                                 "a parse is already in flight");
+    struct InParse {
+        InParse() { parse_state.in_parse = true; }
+        ~InParse() { parse_state.in_parse = false; }
+    } in_parse_latch;
+
     // Borrowed for the length of the parse, as it always has been: nothing
     // holds a reference to the canon after this returns.
-    callback = canon.ptr();
+    parse_state.callback = canon.ptr();
 
     // Protocol selection, once, before anything is interpreted: a mode that
     // could flip mid-parse would leave the canon's program half in each
     // protocol, and a per-call attribute check would cost more than the
     // renderer saves.
-    // Before arming: a renderer reads its starting state off the canon, and a
-    // failed read has to be visible rather than cleared by the reset below.
-    interp_error = 0;
-    if(!GCodeRenderer::arm(callback)) throw py::error_already_set();
-    last_delivered_sequence_number = -1;
+    // Before the renderer is made: it reads its starting state off the canon,
+    // and a failed read has to be visible rather than cleared by the reset
+    // below.
+    parse_state.interp_error = 0;
+    {
+        auto renderer = GCodeRenderer::make(parse_state.callback);
+        if(!renderer && PyErr_Occurred()) throw py::error_already_set();
+        if(renderer) parse_state.canon = std::move(renderer);
+        else parse_state.canon = std::make_unique<CallbackCanon>();
+    }
+    parse_state.last_delivered_sequence_number = -1;
 
-    if(pinterp) {
-        delete pinterp;
-        pinterp = NULL;
+    if(parse_state.pinterp) {
+        delete parse_state.pinterp;
+        parse_state.pinterp = NULL;
     }
     if(interpname && *interpname)
-        pinterp = interp_from_shlib(interpname);
-    if(!pinterp)
-        pinterp = new Interp;
+        parse_state.pinterp = interp_from_shlib(interpname);
+    if(!parse_state.pinterp)
+        parse_state.pinterp = new Interp;
 
-    for(int i=0; i<USER_DEFINED_FUNCTION_NUM; i++) 
+    for(int i=0; i<USER_DEFINED_FUNCTION_NUM; i++)
         USER_DEFINED_FUNCTION[i] = user_defined_function;
 
     last = clock::now();
 
-    metric=false;
-    length_units_known = false;
-    angle_units_known = false;
-    last_sequence_number = -1;
+    parse_state.metric = false;
+    parse_state.last_sequence_number = -1;
 
-    _pos_x = _pos_y = _pos_z = _pos_a = _pos_b = _pos_c = 0;
-    _pos_u = _pos_v = _pos_w = 0;
+    parse_state.pos_x = parse_state.pos_y = parse_state.pos_z = 0;
+    parse_state.pos_a = parse_state.pos_b = parse_state.pos_c = 0;
+    parse_state.pos_u = parse_state.pos_v = parse_state.pos_w = 0;
 
-    pinterp->init();
-    pinterp->open(f);
+    parse_state.pinterp->init();
+    parse_state.pinterp->open(f);
 
     maybe_new_line();
 
@@ -933,26 +904,26 @@ static py::object parse_file(const char *f, py::handle canon,
             if(!item) throw py::error_already_set();
             const char *code = PyUnicode_AsUTF8(item);
             if(!code) throw py::error_already_set();
-            result = pinterp->read(code);
+            result = parse_state.pinterp->read(code);
             if(!RESULT_OK) goto out_error;
-            result = pinterp->execute();
+            result = parse_state.pinterp->execute();
         }
     }
     if(unitcode && RESULT_OK) {
-        result = pinterp->read(unitcode);
+        result = parse_state.pinterp->read(unitcode);
         if(!RESULT_OK) goto out_error;
-        result = pinterp->execute();
+        result = parse_state.pinterp->execute();
     }
 
     if(initcode && RESULT_OK) {
-        result = pinterp->read(initcode);
+        result = parse_state.pinterp->read(initcode);
         if(!RESULT_OK) goto out_error;
-        result = pinterp->execute();
+        result = parse_state.pinterp->execute();
     }
 
-    while(!interp_error && RESULT_OK) {
+    while(!parse_state.interp_error && RESULT_OK) {
         error_line_offset = 1;
-        result = pinterp->read();
+        result = parse_state.pinterp->read();
         if((++lines_read & (clock_every - 1)) == 0) {
             clock::time_point now = clock::now();
             if(now - last >= tick) {
@@ -960,10 +931,10 @@ static py::object parse_file(const char *f, py::handle canon,
                 // a long run of moves on one line, and keeps check_abort() -
                 // which pumps AXIS's event loop - from running with a pending
                 // exception raised by the report.
-                GCodeRenderer::progress();
-                if(interp_error) break;
+                parse_state.canon->progress();
+                if(parse_state.interp_error) break;
                 if(check_abort()) {
-                    GCodeRenderer::finish();
+                    parse_state.canon->finish();
                     throw py::error_already_set();
                 }
                 // The reading taken before the two calls, so a slow repaint
@@ -973,19 +944,19 @@ static py::object parse_file(const char *f, py::handle canon,
         }
         if(!RESULT_OK) break;
         error_line_offset = 0;
-        result = pinterp->execute();
+        result = parse_state.pinterp->execute();
     }
 out_error:
-    if(pinterp)
+    if(parse_state.pinterp)
     {
-        auto interp = dynamic_cast<Interp*>(pinterp);
+        auto interp = dynamic_cast<Interp*>(parse_state.pinterp);
         if(interp) interp->_setup.use_lazy_close = false;
-        pinterp->close();
+        parse_state.pinterp->close();
     }
-    if(interp_error) {
+    if(parse_state.interp_error) {
         // Hand over what was rendered before the failure: a partial preview is
         // what a partial program has always produced.
-        GCodeRenderer::finish();
+        parse_state.canon->finish();
         if(!PyErr_Occurred()) {
             PyErr_Format(PyExc_RuntimeError,
                     "interp_error > 0 but no Python exception set");
@@ -995,15 +966,17 @@ out_error:
             PyErr_Format(PyExc_RuntimeError,"parse_file interp_error");
             fprintf(stderr,"!!!%s: parse_file() f=%s\n"
                     "!!!interp_error=%d result=%d last_sequence_number=%d\n",
-                    __FILE__,f,interp_error,result,last_sequence_number);
+                    __FILE__,f,parse_state.interp_error,result,
+                    parse_state.last_sequence_number);
         }
         throw py::error_already_set();
     }
     PyErr_Clear();
     maybe_new_line();
-    GCodeRenderer::finish();
-    if(PyErr_Occurred()) { interp_error = 1; goto out_error; }
-    return py::make_tuple(result, last_sequence_number + error_line_offset);
+    parse_state.canon->finish();
+    if(PyErr_Occurred()) { parse_state.interp_error = 1; goto out_error; }
+    return py::make_tuple(result,
+                          parse_state.last_sequence_number + error_line_offset);
 }
 
 
@@ -1013,10 +986,10 @@ static char savedError[LINELEN+1];
 static py::str rs274_strerror(int err) {
     // The text belongs to the interpreter the last parse built; without one
     // there is nothing to ask, and dereferencing it would end the process.
-    if(!pinterp)
+    if(!parse_state.pinterp)
         throw std::runtime_error("gcode.strerror: no interpreter yet - "
                                  "call gcode.parse first");
-    pinterp->error_text(err, savedError, LINELEN);
+    parse_state.pinterp->error_text(err, savedError, LINELEN);
     return py::str(savedError);
 }
 

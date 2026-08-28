@@ -32,68 +32,53 @@
 
 namespace py = pybind11;
 
-void GCodeRenderer::progress() {
-    if(!active()) return;
-    // Never call into Python with an exception pending: the canon would be
-    // handed a broken interpreter state, and the error we already have is the
-    // one worth reporting.
-    if(interp_error) return;
-    if(!owned()) return;
-    instance_->report_progress();
-}
-
-void GCodeRenderer::comment(const char *text) {
-    if(!active()) return;
-    // The canon has already had this comment. If it raised - `(AXIS,stop)`
-    // does - the parse is over, and the word is not read for a hide either.
-    if(interp_error) return;
-    if(!owned()) return;
-    instance_->note_comment(text);
-}
-
-// The transform. Each of the three arrives in inches, already converted, at
-// the moment its callback forwards - so there is nothing to read back off the
-// canon and nothing that can go stale between the call and the move it
-// applies to.
-void GCodeRenderer::set_g5x(const Point9 &offsets) {
-    if(!active() || interp_error || !owned()) return;
-    instance_->g5x_ = offsets;
-}
-
-void GCodeRenderer::set_g92(const Point9 &offsets) {
-    if(!active() || interp_error || !owned()) return;
-    instance_->g92_ = offsets;
-}
-
-void GCodeRenderer::set_rotation_xy(double degrees) {
-    if(!active() || interp_error || !owned()) return;
-    GCodeRenderer *r = instance_;
-    r->rotation_xy_ = degrees;
+void GCodeRenderer::set_xy_rotation(double degrees) {
+    if(parse_state.interp_error) return;
+    rotation_xy_ = degrees;
     // `M_PI / 180.0` folded first, which is what `math.radians` multiplies by:
     // the fill this replaced took its sin and cos from the canon, so keeping
     // the argument bit-identical keeps the baked expectations so too.
     double rad = degrees * (M_PI / 180.0);
-    r->rotation_cos_ = cos(rad);
-    r->rotation_sin_ = sin(rad);
+    rotation_cos_ = cos(rad);
+    rotation_sin_ = sin(rad);
     // The angle back, as it has always been computed here.
     double back = -degrees * M_PI / 180.0;
-    r->unrot_cos_ = cos(back);
-    r->unrot_sin_ = sin(back);
-}
-void GCodeRenderer::finish() { if(active()) instance_->hand_over(); }
-void GCodeRenderer::note_plane(int plane) {
-    if(active()) instance_->plane_ = plane;
+    unrot_cos_ = cos(back);
+    unrot_sin_ = sin(back);
 }
 
-void GCodeRenderer::arc(int line_number, double first_end, double second_end,
-                        double first_axis, double second_axis, int rotation,
-                        double axis_end_point, double a, double b, double c,
-                        double u, double v, double w) {
-    if(!owned()) return;
-    last_sequence_number = line_number;
-    instance_->render_arc(line_number, first_end, second_end, first_axis,
-                          second_axis, rotation, axis_end_point, a, b, c,
-                          u, v, w, rate_);
+void GCodeRenderer::arc_feed(int line_number, double first_end, double second_end,
+                             double first_axis, double second_axis, int rotation,
+                             double axis_end_point, double a, double b, double c,
+                             double u, double v, double w) {
+    if(parse_state.interp_error) return;
+    parse_state.last_sequence_number = line_number;
+    render_arc(line_number, first_end, second_end, first_axis,
+               second_axis, rotation, axis_end_point, a, b, c,
+               u, v, w, rate_);
+}
+
+// The unit constants, cached on first ask: arc_segments() wants the length
+// units once per arc for its small-arc test, which here is once per arc
+// *rendered* - thousands of Python calls for a number that cannot move.
+double GCodeRenderer::external_length_units() {
+    if(length_units_known_) return length_units_;
+    double d = read_external_length_units();
+    if(!parse_state.interp_error) {
+        length_units_ = d;
+        length_units_known_ = true;
+    }
+    return d;
+}
+
+double GCodeRenderer::external_angle_units() {
+    if(angle_units_known_) return angle_units_;
+    double d = read_external_angle_units();
+    if(!parse_state.interp_error) {
+        angle_units_ = d;
+        angle_units_known_ = true;
+    }
+    return d;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,12 +153,11 @@ static py::object array_view(py::object owner, void *ptr, Py_ssize_t nitems,
     return py::cast(ArrayView{std::move(owner), ptr, nitems, itemsize, format});
 }
 
-static py::tuple triple(const double *v) {
+static py::tuple triple(const Point3 &v) {
     return py::make_tuple(v[0], v[1], v[2]);
 }
 
-static py::tuple points_tuple(const double pts[MAX_PLANES][POINT_DIMS],
-                              int nplanes) {
+static py::tuple points_tuple(const PlanePoints &pts, int nplanes) {
     py::tuple out(nplanes);
     for(int i = 0; i < nplanes; i++) out[i] = triple(pts[i]);
     return out;
@@ -268,12 +252,16 @@ bool GCodeRenderer::read_planes() {
         py::object planes = pg.attr("planes");
         py::object ro = pg.attr("ro");
 
-        double rox = ro.attr("x").cast<double>();
-        double roy = ro.attr("y").cast<double>();
-        double roz = ro.attr("z").cast<double>();
         long mask = ro.attr("axis_mask").cast<long>();
-        respect_offsets_ = PyObject_IsTrue(ro.attr("respect_offsets").ptr());
-        data_->respect_offsets = respect_offsets_;
+        // The pivot is baked into each rotary op below, so `respect` is read
+        // here and nowhere else: it cannot change once a parse has started.
+        bool respect = PyObject_IsTrue(ro.attr("respect_offsets").ptr());
+        double rox = 0.0, roy = 0.0, roz = 0.0;
+        if(respect) {
+            rox = ro.attr("x").cast<double>();
+            roy = ro.attr("y").cast<double>();
+            roz = ro.attr("z").cast<double>();
+        }
 
         py::sequence names = planes.cast<py::sequence>();
         size_t n = py::len(names);
@@ -330,25 +318,19 @@ bool GCodeRenderer::read_planes() {
     return true;
 }
 
-bool GCodeRenderer::arm(PyObject *canon_ptr) {
-    owner_ = nullptr;
-    rate_ = 60.0;
-    speed_ = 0.0;
-    delete instance_;
-    instance_ = nullptr;
-
+std::unique_ptr<GCodeRenderer> GCodeRenderer::make(PyObject *canon_ptr) {
     py::handle canon(canon_ptr);
     py::object flag;
     try {
         flag = canon.attr("use_gcode_renderer");
     } catch(py::error_already_set &e) {
-        if(!e.matches(PyExc_AttributeError)) { e.restore(); return false; }
-        return true;                    // no attribute: the callback protocol
+        if(!e.matches(PyExc_AttributeError)) { e.restore(); return nullptr; }
+        return nullptr;                 // no attribute: the callback protocol
     }
     // Anything that is not a bool is not an opt-in - see the note on
     // catch-all `__getattr__` in the header. Callback protocol, no complaint:
     // a canon that never mentions the flag must not be made to fail.
-    if(!PyBool_Check(flag.ptr()) || flag.ptr() != Py_True) return true;
+    if(!PyBool_Check(flag.ptr()) || flag.ptr() != Py_True) return nullptr;
 
     // Fail fast rather than fall back: a canon that asked for a preview and
     // silently got per-move callbacks would look like it worked and quietly
@@ -364,10 +346,10 @@ bool GCodeRenderer::arm(PyObject *canon_ptr) {
         PyErr_SetString(PyExc_TypeError,
                 "parse: canon sets use_gcode_renderer but has no callable "
                 "adopt_geometry");
-        return false;
+        return nullptr;
     }
 
-    GCodeRenderer *r = new GCodeRenderer(canon);
+    std::unique_ptr<GCodeRenderer> r(new GCodeRenderer(canon));
     r->data_ = new PreviewData();
     for(int i = 0; i < EXTENT_KINDS; i++)
         for(int j = 0; j < POINT_DIMS; j++) {
@@ -379,10 +361,7 @@ bool GCodeRenderer::arm(PyObject *canon_ptr) {
         r->data_->drawn[1][j] = -9e99;
     }
     r->data_->tool_numbers.push_back(0);         // ordinal 0 is None
-    if(!r->read_planes()) {
-        delete r;
-        return false;
-    }
+    if(!r->read_planes()) return nullptr;
     // getattr-with-default swallows whatever the read raised, which is what a
     // canon that simply has no progress hook needs.
     r->progress_ = py::getattr(canon, "renderer_progress", py::none());
@@ -410,13 +389,8 @@ bool GCodeRenderer::arm(PyObject *canon_ptr) {
             break;
         }
     }
-    if(PyErr_Occurred()) {
-        delete r;
-        return false;
-    }
-    instance_ = r;
-    owner_ = canon_ptr;
-    return true;
+    if(PyErr_Occurred()) return nullptr;
+    return r;
 }
 
 GCodeRenderer::~GCodeRenderer() {
@@ -427,7 +401,7 @@ GCodeRenderer::~GCodeRenderer() {
 // fill depends on, counted as a depth so nested spans close in order. The rest
 // of the vocabulary - `stop`, `notify`, the foam Z levels - is the canon's own
 // and reached it through the forward that precedes this call.
-void GCodeRenderer::note_comment(const char *text) {
+void GCodeRenderer::comment(const char *text) {
     const char *rest;
     if(!strncmp(text, "AXIS,", 5)) rest = text + 5;
     else if(!strncmp(text, "PREVIEW,", 8)) rest = text + 8;
@@ -478,40 +452,28 @@ void GCodeRenderer::transform(const Point9 &in, Point9 &out) const {
 
 // The GEOMETRY-string transform (the C vertex9), for one point through one
 // compiled plane.
-static void plane_point(const std::vector<GeomOp> &ops, bool respect,
-                        const Point9 &pts9, double out[POINT_DIMS]) {
+static void plane_point(const std::vector<GeomOp> &ops,
+                        const Point9 &pts9, Point3 &out) {
     out[0] = out[1] = out[2] = 0.0;
-    for(const GeomOp &op : ops) {
-        if(!op.rotate) {
-            out[op.a] += pts9[op.col] * op.sign;
-            continue;
-        }
-        double theta = pts9[op.col] * op.sign * (M_PI / 180.0);
-        double c = cos(theta), s = sin(theta);
-        double a = out[op.a], b = out[op.b];
-        if(respect) { a -= op.offa; b -= op.offb; }
-        out[op.a] = a * c - b * s;
-        out[op.b] = a * s + b * c;
-    }
+    for(const GeomOp &op : ops) op.apply(pts9, out);
 }
 
 void GCodeRenderer::write_vertex(const Point9 &pts9, int line_number,
-                                unsigned char kind,
-                                double points[MAX_PLANES][POINT_DIMS]) {
+                                unsigned char kind, PlanePoints *points) {
     if(!data_->reserve(1)) {
-        if(!interp_error) PyErr_NoMemory();
-        interp_error ++;
+        if(!parse_state.interp_error) PyErr_NoMemory();
+        parse_state.interp_error ++;
         return;
     }
     size_t at = data_->n;
     for(int i = 0; i < data_->nplanes; i++) {
-        double p[POINT_DIMS];
-        plane_point(data_->ops[i], data_->respect_offsets, pts9, p);
+        Point3 p;
+        plane_point(data_->ops[i], pts9, p);
         for(int j = 0; j < POINT_DIMS; j++) {
             if(p[j] < data_->drawn[0][j]) data_->drawn[0][j] = p[j];
             if(p[j] > data_->drawn[1][j]) data_->drawn[1][j] = p[j];
             data_->pos[i][at * POINT_DIMS + j] = (float)p[j];
-            if(points) points[i][j] = p[j];
+            if(points) (*points)[i][j] = p[j];
         }
     }
     data_->attrs[at * ATTRS_PER_VERTEX] = (uint32_t)line_number;
@@ -520,24 +482,24 @@ void GCodeRenderer::write_vertex(const Point9 &pts9, int line_number,
     data_->n = at + 1;
 }
 
-void GCodeRenderer::mark(int line_number, const Point9 &at, unsigned char kind,
-                        double points[MAX_PLANES][POINT_DIMS]) {
+void GCodeRenderer::mark(int line_number, const Point9 &at,
+                        unsigned char kind, PlanePoints *points) {
     write_vertex(at, line_number, kind, points);
 }
 
 // The four machine-frame extent pairs, from one move's raw endpoints.
 void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
-    double box[BOX_BOUNDS][POINT_DIMS];
+    Box3 box;
     for(int j = 0; j < POINT_DIMS; j++) {
         box[0][j] = p1[j] < p2[j] ? p1[j] : p2[j];
         box[1][j] = p1[j] > p2[j] ? p1[j] : p2[j];
     }
     // The tool-corrected box is the raw box shifted: adding a constant is
     // monotonic, so this is the same box, not an approximation of it.
-    double shift[POINT_DIMS] = {tool_[0], tool_[1], tool_[2]};
-    double rot[BOX_BOUNDS][POINT_DIMS];
+    Point3 shift = {tool_[0], tool_[1], tool_[2]};
+    Box3 rot;
     if(rotation_xy_ != 0.0) {
-        double u1[POINT_DIMS], u2[POINT_DIMS];
+        Point3 u1, u2;
         unrotate_xy(p1, u1);
         unrotate_xy(p2, u2);
         for(int j = 0; j < POINT_DIMS; j++) {
@@ -550,8 +512,8 @@ void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
     bool rotated = rotation_xy_ != 0.0;
     for(int i = 0; i < EXTENT_KINDS; i++) {
         bool unrotated = (i >= 2) && rotated;
-        const double *lo = unrotated ? rot[0] : box[0];
-        const double *hi = unrotated ? rot[1] : box[1];
+        const Point3 &lo = unrotated ? rot[0] : box[0];
+        const Point3 &hi = unrotated ? rot[1] : box[1];
         bool notool = (i == 1 || i == 3);
         for(int j = 0; j < POINT_DIMS; j++) {
             double a = notool ? lo[j] + shift[j] : lo[j];
@@ -564,7 +526,7 @@ void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
 
 // The g5x XY rotation taken back out about the g5x origin, for the
 // rotation-removed extents. Z is left alone.
-void GCodeRenderer::unrotate_xy(const Point9 &p, double out[POINT_DIMS]) const {
+void GCodeRenderer::unrotate_xy(const Point9 &p, Point3 &out) const {
     double tx = p[0] - g5x_[0];
     double ty = p[1] - g5x_[1];
     out[0] = tx * unrot_cos_ - ty * unrot_sin_ + g5x_[0];
@@ -680,8 +642,8 @@ void GCodeRenderer::event(Kind kind, int line_number,
         rec.lineno = line_number;
         rec.plane = plane_code(plane_);
         rec.m1xx = (kind == M1xx);
-        rec.raw[0] = lo_[0]; rec.raw[1] = lo_[1]; rec.raw[2] = lo_[2];
-        mark(line_number, lo_, KIND_DWELL, rec.pts);
+        rec.raw = {lo_[0], lo_[1], lo_[2]};
+        mark(line_number, lo_, KIND_DWELL, &rec.pts);
         data_->dwells.push_back(rec);
         return;
     }
@@ -702,7 +664,7 @@ void GCodeRenderer::event(Kind kind, int line_number,
         // changes the ordinal stops advancing and would hand the record the
         // previous tool's number.
         rec.tool = tool;
-        mark(line_number, lo_, KIND_TOOLCHANGE, rec.pts);
+        mark(line_number, lo_, KIND_TOOLCHANGE, &rec.pts);
         data_->toolchanges.push_back(rec);
         first_move_ = true;
         // Still forwarded, and not for the record: the interpreter reads the
@@ -715,12 +677,12 @@ void GCodeRenderer::event(Kind kind, int line_number,
     default:
         PyErr_Format(PyExc_RuntimeError,
                 "gcode renderer: unknown event kind %d", (int)kind);
-        interp_error ++;
+        parse_state.interp_error ++;
     }
 }
 
 void GCodeRenderer::report_progress() {
-    if(interp_error) return;
+    if(parse_state.interp_error) return;
     if(!consumed_) return;
     consumed_ = false;
     if(!progress_) return;
@@ -735,8 +697,8 @@ void GCodeRenderer::hand_over() {
     // back: what was rendered before the failure is still a preview.
     PyObject *type, *value, *tb;
     PyErr_Fetch(&type, &value, &tb);
-    int errors = interp_error;
-    interp_error = 0;
+    int errors = parse_state.interp_error;
+    parse_state.interp_error = 0;
     sync_out(false);
     char name[4];
     for(int i = 0; i < 9; i++) {
@@ -765,7 +727,7 @@ void GCodeRenderer::hand_over() {
         PyErr_Restore(type, value, tb);
         if(!errors) errors = 1;
     }
-    interp_error = errors;
+    parse_state.interp_error = errors;
 }
 
 void GCodeRenderer::render_arc(int line_number, double first_end, double second_end,
