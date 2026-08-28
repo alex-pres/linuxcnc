@@ -199,44 +199,19 @@ int arc_segments(const Point9 &lo, int plane,
 //     instead, out of the same text, after the canon has had it.
 //   * `message` is still forwarded: an `(MSG,...)` is addressed to the
 //     operator, not to the preview.
-//   * `change_tool` is still forwarded - not for the record, which is written
-//     here, but because the interpreter reads the canon's tool table for a G43
-//     after it, and a GUI's override is what moves the simulated spindle slot.
-//     The canon keeps no list of its own: `GLCanon.adopt_geometry` rebuilds
-//     `tool_list` out of the records at the end of the parse.
-//   * `next_line`, before each of the above, because `GLCanon.comment` reads
-//     `self.state.gcodes` for the foam Z levels and gremlin and qtvcp read it
-//     again after the parse for the program's units. It is delivered on the
-//     lines that still forward, which is a handful per parse rather than one
-//     per line.
+//   * `change_tool` is still forwarded
+//   * `next_line`, before `comment` and `message`, because `GLCanon.comment`
+//     reads `self.state.gcodes` for the foam Z levels; and once after the
+//     parse ends, because gremlin and qtvcp read `state.gcodes` again for the
+//     program's units, which a program without comments would otherwise never
+//     deliver. A handful per parse rather than one per line.
 //
-// Everything else is dropped. The g5x/g92 offsets, the XY rotation, the plane
-// and the feed rate used to be forwarded as pure observations; nothing in the
-// tree reads the canon's copy of any of them on a rendered parse (the DROs
-// read the *status channel*, and the lengths and the transform are the
-// record's), and the feed rate alone was thousands of calls a file, because
-// the interpreter reports an F word whether or not it changed anything. A
-// canon that wants them can read the finished program instead.
-// `tool_offset` is likewise not forwarded: it moved only geometry state the
-// renderer now owns.
-//
-// Ordering falls out: a move is rendered where it happens, under exactly the
-// offsets, rotation, plane and suppression in force at that point, because
-// nothing is held back, and every one of those is captured here as the call
-// that changes it goes past. Nothing flows Python to C mid-parse.
-//
-// A parse therefore starts from a zero transform rather than from whatever the
-// canon was holding: the interpreter re-issues the offsets and the rotation
-// out of the parameter file during `init()`, which happens after arming, so
-// the renderer receives them as canon calls like any others.
 //
 // Progress is reported through the canon's optional `renderer_progress`: a
 // rendered move delivers no `next_line`, so that is what a GUI's progress bar
 // counts instead. It fires before each still-forwarded callback and on
 // parse_file's 100ms tick, which is what actually paces it - a rendered parse
-// forwards so little that the tick is usually the only source. A report that
-// had nothing to report since the last one is dropped, so an idle stretch
-// costs nothing.
+// forwards so little that the tick is usually the only source.
 //
 // Lifetime: the program's arrays are owned by the `gcode.PreviewGeometry` the
 // handover creates and are never handed out before the parse ends, so no reader
