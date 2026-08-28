@@ -577,13 +577,10 @@ void GCodeRenderer::fill(int line_number, const Point9 &p1, const Point9 &p2,
     data_->has_cur = true;
 }
 
-void GCodeRenderer::move(Kind kind, int line_number,
-                          double x, double y, double z,
-                          double a, double b, double c,
-                          double u, double v, double w, double rate) {
+void GCodeRenderer::move(Kind kind, int line_number, const Point9 &in,
+                         double rate) {
     last_line_ = line_number;
     consumed_ = true;
-    const Point9 in = {x, y, z, a, b, c, u, v, w};
     if(kind >= Dwell) { event(kind, line_number, in); return; }
     // A hidden move touches nothing at all, not even the chain point.
     if(suppress_ > 0) return;

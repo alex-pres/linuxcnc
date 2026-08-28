@@ -258,40 +258,33 @@ public:
                   double first_axis, double second_axis, int rotation,
                   double axis_end_point, double a, double b, double c,
                   double u, double v, double w) override;
-    void straight_feed(int line_number, double x, double y, double z,
-                       double a, double b, double c,
-                       double u, double v, double w) override {
-        append(Feed, line_number, x, y, z, a, b, c, u, v, w);
+    void straight_feed(int line_number, const Point9 &p) override {
+        append(Feed, line_number, p);
     }
-    void straight_traverse(int line_number, double x, double y, double z,
-                           double a, double b, double c,
-                           double u, double v, double w) override {
-        append(Traverse, line_number, x, y, z, a, b, c, u, v, w);
+    void straight_traverse(int line_number, const Point9 &p) override {
+        append(Traverse, line_number, p);
     }
-    void straight_probe(int line_number, double x, double y, double z,
-                        double a, double b, double c,
-                        double u, double v, double w) override {
-        append(Probe, line_number, x, y, z, a, b, c, u, v, w);
+    void straight_probe(int line_number, const Point9 &p) override {
+        append(Probe, line_number, p);
     }
     // a..w zero, exactly the arguments the `rigid_tap` callback does not
     // have; the renderer joins x,y,z to the chain point's a..w.
     void rigid_tap(int line_number, double x, double y, double z) override {
-        append(RigidTap, line_number, x, y, z, 0, 0, 0, 0, 0, 0);
+        append(RigidTap, line_number, {x, y, z});
     }
     // Rendered like any other event, and not a progress report of its own: a
     // G81/G82 cycle emits one dwell per hole.
     void dwell(double seconds) override {
-        append(Dwell, parse_state.current_line(), seconds, 0, 0, 0, 0, 0, 0, 0, 0);
+        append(Dwell, parse_state.current_line(), {seconds});
     }
     void user_defined_function(int num, double arg1, double arg2) override {
-        append(M1xx, parse_state.current_line(), num, arg1, arg2, 0, 0, 0, 0, 0, 0);
+        append(M1xx, parse_state.current_line(), {(double)num, arg1, arg2});
     }
     void change_tool(int tool) override {
-        append(ChangeTool, parse_state.current_line(), tool, 0, 0, 0, 0, 0, 0, 0, 0);
+        append(ChangeTool, parse_state.current_line(), {(double)tool});
     }
     void tool_offset(const Point9 &o) override {
-        append(ToolOffset, parse_state.current_line(),
-               o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], o[8]);
+        append(ToolOffset, parse_state.current_line(), o);
     }
 
     // The transform, from the three canon calls that carry it. Each arrives
@@ -373,20 +366,16 @@ private:
     // Every rendered move and event funnels through here. No next_line is
     // delivered for a rendered move, but the error line the parse reports
     // must still advance with it.
-    void append(Kind kind, int line_number,
-                double x, double y, double z,
-                double a, double b, double c,
-                double u, double v, double w) {
+    // The trailing axes an event does not carry are zero: a Point9 written
+    // short zero-fills, which is what every caller below wants.
+    void append(Kind kind, int line_number, const Point9 &p) {
         if(parse_state.interp_error) return;
         parse_state.last_sequence_number = line_number;
-        move(kind, line_number, x, y, z, a, b, c, u, v, w, rate_);
+        move(kind, line_number, p, rate_);
     }
 
     // -- one parse's pipeline and its program ------------------------------
-    void move(Kind kind, int line_number,
-              double x, double y, double z,
-              double a, double b, double c,
-              double u, double v, double w, double rate);
+    void move(Kind kind, int line_number, const Point9 &in, double rate);
     void render_arc(int line_number, double first_end, double second_end,
                     double first_axis, double second_axis, int rotation,
                     double axis_end_point, double a, double b, double c,

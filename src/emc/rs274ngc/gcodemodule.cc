@@ -205,23 +205,20 @@ public:
         forward("arc_feed", first_end, second_end, first_axis, second_axis,
                 rotation, axis_end_point, a, b, c, u, v, w);
     }
-    void straight_feed(int line_number, double x, double y, double z,
-                       double a, double b, double c,
-                       double u, double v, double w) override {
+    void straight_feed(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
-        forward("straight_feed", x, y, z, a, b, c, u, v, w);
+        forward("straight_feed", p[0], p[1], p[2], p[3], p[4], p[5],
+                p[6], p[7], p[8]);
     }
-    void straight_traverse(int line_number, double x, double y, double z,
-                           double a, double b, double c,
-                           double u, double v, double w) override {
+    void straight_traverse(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
-        forward("straight_traverse", x, y, z, a, b, c, u, v, w);
+        forward("straight_traverse", p[0], p[1], p[2], p[3], p[4], p[5],
+                p[6], p[7], p[8]);
     }
-    void straight_probe(int line_number, double x, double y, double z,
-                        double a, double b, double c,
-                        double u, double v, double w) override {
+    void straight_probe(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
-        forward("straight_probe", x, y, z, a, b, c, u, v, w);
+        forward("straight_probe", p[0], p[1], p[2], p[3], p[4], p[5],
+                p[6], p[7], p[8]);
     }
     void rigid_tap(int line_number, double x, double y, double z) override {
         maybe_new_line(line_number);
@@ -279,6 +276,20 @@ public:
         return read_external_angle_units();
     }
 };
+
+// The interpreter works in the program's own units; every canon method below
+// hands the canon inches. Only lengths convert - the rotary components of a
+// 9-DOF point are degrees in either unit system, and so are left alone.
+static double ensure_inch(double length) {
+    return parse_state.metric ? length / 25.4 : length;
+}
+
+static Point9 ensure_inch(const Point9 &p) {
+    if(!parse_state.metric) return p;
+    return {p[0] / 25.4, p[1] / 25.4, p[2] / 25.4,
+            p[3], p[4], p[5],
+            p[6] / 25.4, p[7] / 25.4, p[8] / 25.4};
+}
 
 //das ist für die Vorschau
 /* G_5_2/G_5_3*/
@@ -389,20 +400,17 @@ void ARC_FEED(int line_number,
               double a_position, double b_position, double c_position,
               double u_position, double v_position, double w_position) {
     // XXX: set _pos_*
-    if(parse_state.metric) {
-        first_end /= 25.4;
-        second_end /= 25.4;
-        first_axis /= 25.4;
-        second_axis /= 25.4;
-        axis_end_point /= 25.4;
-        u_position /= 25.4;
-        v_position /= 25.4;
-        w_position /= 25.4;
-    }
-    parse_state.canon->arc_feed(line_number, first_end, second_end, first_axis,
-                                second_axis, rotation, axis_end_point,
+    parse_state.canon->arc_feed(line_number,
+                                ensure_inch(first_end),
+                                ensure_inch(second_end),
+                                ensure_inch(first_axis),
+                                ensure_inch(second_axis),
+                                rotation,
+                                ensure_inch(axis_end_point),
                                 a_position, b_position, c_position,
-                                u_position, v_position, w_position);
+                                ensure_inch(u_position),
+                                ensure_inch(v_position),
+                                ensure_inch(w_position));
 }
 
 void STRAIGHT_FEED(int line_number,
@@ -412,8 +420,8 @@ void STRAIGHT_FEED(int line_number,
     parse_state.pos_x=x; parse_state.pos_y=y; parse_state.pos_z=z;
     parse_state.pos_a=a; parse_state.pos_b=b; parse_state.pos_c=c;
     parse_state.pos_u=u; parse_state.pos_v=v; parse_state.pos_w=w;
-    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    parse_state.canon->straight_feed(line_number, x, y, z, a, b, c, u, v, w);
+    parse_state.canon->straight_feed(line_number,
+            ensure_inch({x, y, z, a, b, c, u, v, w}));
 }
 
 void STRAIGHT_TRAVERSE(int line_number,
@@ -423,23 +431,23 @@ void STRAIGHT_TRAVERSE(int line_number,
     parse_state.pos_x=x; parse_state.pos_y=y; parse_state.pos_z=z;
     parse_state.pos_a=a; parse_state.pos_b=b; parse_state.pos_c=c;
     parse_state.pos_u=u; parse_state.pos_v=v; parse_state.pos_w=w;
-    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    parse_state.canon->straight_traverse(line_number, x, y, z, a, b, c, u, v, w);
+    parse_state.canon->straight_traverse(line_number,
+            ensure_inch({x, y, z, a, b, c, u, v, w}));
 }
 
 void SET_G5X_OFFSET(int g5x_index,
                     double x, double y, double z,
                     double a, double b, double c,
                     double u, double v, double w) {
-    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    parse_state.canon->set_g5x_offset(g5x_index, {x, y, z, a, b, c, u, v, w});
+    parse_state.canon->set_g5x_offset(g5x_index,
+            ensure_inch({x, y, z, a, b, c, u, v, w}));
 }
 
 void SET_G92_OFFSET(double x, double y, double z,
                     double a, double b, double c,
                     double u, double v, double w) {
-    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    parse_state.canon->set_g92_offset({x, y, z, a, b, c, u, v, w});
+    parse_state.canon->set_g92_offset(
+            ensure_inch({x, y, z, a, b, c, u, v, w}));
 }
 
 void SET_XY_ROTATION(double t) {
@@ -482,8 +490,7 @@ void RELOAD_TOOLDATA(void) {
  * time feed wrong anyway..
  */
 void SET_FEED_RATE(double rate) {
-    if(parse_state.metric) rate /= 25.4;
-    parse_state.canon->set_feed_rate(rate);
+    parse_state.canon->set_feed_rate(ensure_inch(rate));
 }
 
 void DWELL(double time) {
@@ -513,11 +520,10 @@ void SET_TOOL_TABLE_ENTRY(int /*pocket*/, int /*toolno*/, const EmcPose& /*offse
 
 void USE_TOOL_LENGTH_OFFSET(const EmcPose& offset) {
     parse_state.tool_offset = offset;
-    const double scale = parse_state.metric ? 25.4 : 1.0;
-    parse_state.canon->tool_offset({
-            offset.tran.x / scale, offset.tran.y / scale, offset.tran.z / scale,
+    parse_state.canon->tool_offset(ensure_inch({
+            offset.tran.x, offset.tran.y, offset.tran.z,
             offset.a, offset.b, offset.c,
-            offset.u / scale, offset.v / scale, offset.w / scale});
+            offset.u, offset.v, offset.w}));
 }
 
 void SET_FEED_REFERENCE(double /*reference*/) { }
@@ -597,13 +603,14 @@ void STRAIGHT_PROBE(int line_number,
     parse_state.pos_x=x; parse_state.pos_y=y; parse_state.pos_z=z;
     parse_state.pos_a=a; parse_state.pos_b=b; parse_state.pos_c=c;
     parse_state.pos_u=u; parse_state.pos_v=v; parse_state.pos_w=w;
-    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; u /= 25.4; v /= 25.4; w /= 25.4; }
-    parse_state.canon->straight_probe(line_number, x, y, z, a, b, c, u, v, w);
+    parse_state.canon->straight_probe(line_number,
+            ensure_inch({x, y, z, a, b, c, u, v, w}));
 }
 void RIGID_TAP(int line_number,
                double x, double y, double z, double /*scale*/) {
-    if(parse_state.metric) { x /= 25.4; y /= 25.4; z /= 25.4; }
-    parse_state.canon->rigid_tap(line_number, x, y, z);
+    parse_state.canon->rigid_tap(line_number, ensure_inch(x),
+                                 ensure_inch(y),
+                                 ensure_inch(z));
 }
 double GET_EXTERNAL_MOTION_CONTROL_TOLERANCE() { return 0.1; }
 double GET_EXTERNAL_MOTION_CONTROL_NAIVECAM_TOLERANCE() { return 0.1; }
@@ -706,19 +713,8 @@ int GET_EXTERNAL_ADAPTIVE_FEED_ENABLE() {return 0;}
 int GET_EXTERNAL_FEED_HOLD_ENABLE() {return 1;}
 
 int GET_EXTERNAL_OFFSET_APPLIED() {return 0;}
-EmcPose GET_EXTERNAL_OFFSETS() {
-    EmcPose e;
-    e.tran.x = 0;
-    e.tran.y = 0;
-    e.tran.z = 0;
-    e.a      = 0;
-    e.b      = 0;
-    e.c      = 0;
-    e.u      = 0;
-    e.v      = 0;
-    e.w      = 0;
-    return e;
-};
+
+EmcPose GET_EXTERNAL_OFFSETS() { return {}; } // Aggregate value-initialisation zeroes tran.x..w.
 
 int GET_EXTERNAL_AXIS_MASK() {
     int mask = 7;                                       /* XYZABC */

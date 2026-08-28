@@ -68,18 +68,12 @@ public:
                           double first_axis, double second_axis, int rotation,
                           double axis_end_point, double a, double b, double c,
                           double u, double v, double w) = 0;
-    virtual void straight_feed(int line_number,
-                               double x, double y, double z,
-                               double a, double b, double c,
-                               double u, double v, double w) = 0;
-    virtual void straight_traverse(int line_number,
-                                   double x, double y, double z,
-                                   double a, double b, double c,
-                                   double u, double v, double w) = 0;
-    virtual void straight_probe(int line_number,
-                                double x, double y, double z,
-                                double a, double b, double c,
-                                double u, double v, double w) = 0;
+    // The endpoint as one 9-DOF point, already in inches. arc_feed keeps its
+    // loose arguments: its first six are arc geometry in the active plane,
+    // not axes, so there is no point to pack.
+    virtual void straight_feed(int line_number, const Point9 &p) = 0;
+    virtual void straight_traverse(int line_number, const Point9 &p) = 0;
+    virtual void straight_probe(int line_number, const Point9 &p) = 0;
     virtual void rigid_tap(int line_number,
                            double x, double y, double z) = 0;
 
