@@ -91,18 +91,30 @@ struct GeomOp {
     double offa, offb;                  // rotation offsets, when respected
 };
 
+// A program is drawn once per plane: one plane for a mill, two when a lathe
+// draws its mirrored back side beside the front.
+constexpr int MAX_PLANES = 2;
+// A drawn point is xyz, and a box around drawn points is a min and a max.
+constexpr int POINT_DIMS = 3;
+constexpr int BOX_BOUNDS = 2;
+// The machine-frame extent boxes a program keeps: raw, notool, zero_rxy and
+// notool_zero_rxy, in that order - the four `calc_extents` has always given.
+constexpr int EXTENT_KINDS = 4;
+// Per vertex, beside its xyz: the line number, then kind|tool.
+constexpr int ATTRS_PER_VERTEX = 2;
+
 struct DwellRecord {
     int lineno;
     int plane;                          // 0/1/2, as GLCanon._record_dwell
     bool m1xx;                          // which colour Python attaches
-    double raw[3];                      // machine coords, for canon.dwells
-    double pts[2][3];                   // transformed, per drawn plane
+    double raw[POINT_DIMS];             // machine coords, for canon.dwells
+    double pts[MAX_PLANES][POINT_DIMS]; // transformed, per drawn plane
 };
 
 struct ToolChangeRecord {
     int lineno;
     int tool;                           // as commanded, not the ordinal's entry
-    double pts[2][3];
+    double pts[MAX_PLANES][POINT_DIMS];
 };
 
 struct PreviewData {
@@ -113,14 +125,14 @@ struct PreviewData {
     void shrink();
 
     int nplanes = 1;
-    std::vector<GeomOp> ops[2];         // one compiled transform per plane
+    std::vector<GeomOp> ops[MAX_PLANES];    // one compiled transform per plane
     bool respect_offsets = false;
-    float *pos[2] = {nullptr, nullptr}; // 3 floats per vertex, per plane
+    float *pos[MAX_PLANES] = {};        // POINT_DIMS floats per vertex, per plane
     uint32_t *attrs = nullptr;          // line, kind|tool per vertex
     size_t n = 0, cap = 0;
 
-    double extents[4][2][3];            // raw, notool, zero_rxy, notool_zero_rxy
-    double drawn[2][3];
+    double extents[EXTENT_KINDS][BOX_BOUNDS][POINT_DIMS] = {0, };
+    double drawn[BOX_BOUNDS][POINT_DIMS] = {0, };
     // Summed a move at a time, so a running total drifts with move count -
     // about 4e-12 relative over a million moves, nanometres on a metre of tool
     // path. The baked expectations allow for it; no reader of a path length
@@ -168,15 +180,7 @@ int arc_segments(const Point9 &lo, int plane,
 // is what canons that are not previews (rs274.interpret's PrintCanon, the
 // interpreter tests, out-of-tree users of gcode.parse) are built on.
 //
-// The flag must be a *bool*, not merely truthy: a canon that answers every
-// unknown attribute with a stub - `def __getattr__(self, name): return lambda
-// *a: None`, a common idiom for partial canons, and what
-// tests/interp_initcode's does - would otherwise hand back a callable for both
-// `use_gcode_renderer` and `adopt_geometry` and be opted in without ever
-// asking, silently dropping the whole program into the stub. A canon that sets
-// the flag *and* has no callable consumer is a TypeError rather than a silent
-// fall back: a preview that quietly came out empty looks like a program with
-// nothing in it.
+// The flag must be a *bool* true
 //
 // In renderer mode the canon functions listed under `GCodeRenderer::Kind` do
 // not call Python at all. Instead the renderer runs the whole preview
@@ -368,12 +372,12 @@ private:
               double feedrate, unsigned char cat);
     // One record vertex at `at`, writing its per-plane position to `points`.
     void mark(int line_number, const Point9 &at, unsigned char kind,
-              double points[2][3]);
+              double points[MAX_PLANES][POINT_DIMS]);
     void write_vertex(const Point9 &pts9, int line_number, unsigned char kind,
-                      double points[2][3]);
+                      double points[MAX_PLANES][POINT_DIMS]);
     void accumulate_extents(const Point9 &p1, const Point9 &p2);
     bool read_planes();
-    void unrotate_xy(const Point9 &p, double out[3]) const;
+    void unrotate_xy(const Point9 &p, double out[POINT_DIMS]) const;
     // g92 -> XY rotation -> g5x, the operations and the order
     // `rs274.interpret.Translated.rotate_and_translate` applies - which is
     // where this came from, though that method no longer runs on a rendered

@@ -107,7 +107,7 @@ static const char AXES[9] = {'x','y','z','a','b','c','u','v','w'};
 // ---------------------------------------------------------------------------
 
 PreviewData::~PreviewData() {
-    for(int i = 0; i < 2; i++) free(pos[i]);
+    for(int i = 0; i < MAX_PLANES; i++) free(pos[i]);
     free(attrs);
 }
 
@@ -117,9 +117,9 @@ bool PreviewData::reserve(size_t extra) {
     size_t want = cap * 2;
     if(want < 1024) want = 1024;
     while(want < need) want *= 2;
-    float *grown[2] = {nullptr, nullptr};
+    float *grown[MAX_PLANES] = {};
     for(int i = 0; i < nplanes; i++) {
-        grown[i] = (float*)realloc(pos[i], want * 3 * sizeof(float));
+        grown[i] = (float*)realloc(pos[i], want * POINT_DIMS * sizeof(float));
         if(!grown[i]) {
             // Whatever did grow is still valid and still holds the program;
             // only `cap` decides what may be written, so leaving it alone is
@@ -129,7 +129,7 @@ bool PreviewData::reserve(size_t extra) {
         }
     }
     uint32_t *grown_attrs =
-        (uint32_t*)realloc(attrs, want * 2 * sizeof(uint32_t));
+        (uint32_t*)realloc(attrs, want * ATTRS_PER_VERTEX * sizeof(uint32_t));
     if(!grown_attrs) {
         for(int i = 0; i < nplanes; i++) pos[i] = grown[i];
         return false;
@@ -146,10 +146,10 @@ void PreviewData::shrink() {
     if(cap == n) return;
     size_t want = n ? n : 1;
     for(int i = 0; i < nplanes; i++) {
-        float *fit = (float*)realloc(pos[i], want * 3 * sizeof(float));
+        float *fit = (float*)realloc(pos[i], want * POINT_DIMS * sizeof(float));
         if(fit) pos[i] = fit;           // a refused shrink keeps the slack
     }
-    uint32_t *fit = (uint32_t*)realloc(attrs, want * 2 * sizeof(uint32_t));
+    uint32_t *fit = (uint32_t*)realloc(attrs, want * ATTRS_PER_VERTEX * sizeof(uint32_t));
     if(fit) attrs = fit;
     cap = want;
 }
@@ -172,7 +172,8 @@ static py::tuple triple(const double *v) {
     return py::make_tuple(v[0], v[1], v[2]);
 }
 
-static py::tuple points_tuple(const double pts[2][3], int nplanes) {
+static py::tuple points_tuple(const double pts[MAX_PLANES][POINT_DIMS],
+                              int nplanes) {
     py::tuple out(nplanes);
     for(int i = 0; i < nplanes; i++) out[i] = triple(pts[i]);
     return out;
@@ -200,17 +201,18 @@ void preview_geometry_register(py::module_ &m) {
                 if(plane < 0 || plane >= d.nplanes)
                     throw py::index_error("no such drawn plane");
                 return array_view(std::move(self), d.pos[plane],
-                                  (Py_ssize_t)d.n * 3, sizeof(float), "f");
+                                  (Py_ssize_t)d.n * POINT_DIMS, sizeof(float), "f");
             }, py::arg("plane") = 0,
             "Read-only float32 xyz view of one drawn plane")
         .def("attrs", [](py::object self) {
                 PreviewData &d = py::cast<PreviewData&>(self);
                 return array_view(std::move(self), d.attrs,
-                                  (Py_ssize_t)d.n * 2, sizeof(uint32_t), "I");
+                                  (Py_ssize_t)d.n * ATTRS_PER_VERTEX,
+                                  sizeof(uint32_t), "I");
             }, "Read-only uint32 (line, kind|tool) view")
         .def("extents", [](const PreviewData &d) {
-                py::tuple out(4);
-                for(int i = 0; i < 4; i++)
+                py::tuple out(EXTENT_KINDS);
+                for(int i = 0; i < EXTENT_KINDS; i++)
                     out[i] = py::make_tuple(triple(d.extents[i][0]),
                                             triple(d.extents[i][1]));
                 return out;
@@ -275,7 +277,7 @@ bool GCodeRenderer::read_planes() {
 
         py::sequence names = planes.cast<py::sequence>();
         size_t n = py::len(names);
-        if(n < 1 || n > 2) {
+        if(n < 1 || n > MAX_PLANES) {
             PyErr_SetString(PyExc_ValueError,
                     "parse: the renderer draws one or two planes");
             throw py::error_already_set();
@@ -367,12 +369,12 @@ bool GCodeRenderer::arm(PyObject *canon_ptr) {
 
     GCodeRenderer *r = new GCodeRenderer(canon);
     r->data_ = new PreviewData();
-    for(int i = 0; i < 4; i++)
-        for(int j = 0; j < 3; j++) {
+    for(int i = 0; i < EXTENT_KINDS; i++)
+        for(int j = 0; j < POINT_DIMS; j++) {
             r->data_->extents[i][0][j] = 9e99;
             r->data_->extents[i][1][j] = -9e99;
         }
-    for(int j = 0; j < 3; j++) {
+    for(int j = 0; j < POINT_DIMS; j++) {
         r->data_->drawn[0][j] = 9e99;
         r->data_->drawn[1][j] = -9e99;
     }
@@ -477,7 +479,7 @@ void GCodeRenderer::transform(const Point9 &in, Point9 &out) const {
 // The GEOMETRY-string transform (the C vertex9), for one point through one
 // compiled plane.
 static void plane_point(const std::vector<GeomOp> &ops, bool respect,
-                        const Point9 &pts9, double out[3]) {
+                        const Point9 &pts9, double out[POINT_DIMS]) {
     out[0] = out[1] = out[2] = 0.0;
     for(const GeomOp &op : ops) {
         if(!op.rotate) {
@@ -494,7 +496,8 @@ static void plane_point(const std::vector<GeomOp> &ops, bool respect,
 }
 
 void GCodeRenderer::write_vertex(const Point9 &pts9, int line_number,
-                                unsigned char kind, double points[2][3]) {
+                                unsigned char kind,
+                                double points[MAX_PLANES][POINT_DIMS]) {
     if(!data_->reserve(1)) {
         if(!interp_error) PyErr_NoMemory();
         interp_error ++;
@@ -502,41 +505,42 @@ void GCodeRenderer::write_vertex(const Point9 &pts9, int line_number,
     }
     size_t at = data_->n;
     for(int i = 0; i < data_->nplanes; i++) {
-        double p[3];
+        double p[POINT_DIMS];
         plane_point(data_->ops[i], data_->respect_offsets, pts9, p);
-        for(int j = 0; j < 3; j++) {
+        for(int j = 0; j < POINT_DIMS; j++) {
             if(p[j] < data_->drawn[0][j]) data_->drawn[0][j] = p[j];
             if(p[j] > data_->drawn[1][j]) data_->drawn[1][j] = p[j];
-            data_->pos[i][at * 3 + j] = (float)p[j];
+            data_->pos[i][at * POINT_DIMS + j] = (float)p[j];
             if(points) points[i][j] = p[j];
         }
     }
-    data_->attrs[at * 2] = (uint32_t)line_number;
-    data_->attrs[at * 2 + 1] = (uint32_t)kind | (data_->tool << 8);
+    data_->attrs[at * ATTRS_PER_VERTEX] = (uint32_t)line_number;
+    data_->attrs[at * ATTRS_PER_VERTEX + 1] =
+            (uint32_t)kind | (data_->tool << 8);
     data_->n = at + 1;
 }
 
 void GCodeRenderer::mark(int line_number, const Point9 &at, unsigned char kind,
-                        double points[2][3]) {
+                        double points[MAX_PLANES][POINT_DIMS]) {
     write_vertex(at, line_number, kind, points);
 }
 
 // The four machine-frame extent pairs, from one move's raw endpoints.
 void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
-    double box[2][3];
-    for(int j = 0; j < 3; j++) {
+    double box[BOX_BOUNDS][POINT_DIMS];
+    for(int j = 0; j < POINT_DIMS; j++) {
         box[0][j] = p1[j] < p2[j] ? p1[j] : p2[j];
         box[1][j] = p1[j] > p2[j] ? p1[j] : p2[j];
     }
     // The tool-corrected box is the raw box shifted: adding a constant is
     // monotonic, so this is the same box, not an approximation of it.
-    double shift[3] = {tool_[0], tool_[1], tool_[2]};
-    double rot[2][3];
+    double shift[POINT_DIMS] = {tool_[0], tool_[1], tool_[2]};
+    double rot[BOX_BOUNDS][POINT_DIMS];
     if(rotation_xy_ != 0.0) {
-        double u1[3], u2[3];
+        double u1[POINT_DIMS], u2[POINT_DIMS];
         unrotate_xy(p1, u1);
         unrotate_xy(p2, u2);
-        for(int j = 0; j < 3; j++) {
+        for(int j = 0; j < POINT_DIMS; j++) {
             rot[0][j] = u1[j] < u2[j] ? u1[j] : u2[j];
             rot[1][j] = u1[j] > u2[j] ? u1[j] : u2[j];
         }
@@ -544,12 +548,12 @@ void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
     // raw, notool, zero_rxy, notool_zero_rxy - and with no rotation to remove,
     // the last two are the first two.
     bool rotated = rotation_xy_ != 0.0;
-    for(int i = 0; i < 4; i++) {
+    for(int i = 0; i < EXTENT_KINDS; i++) {
         bool unrotated = (i >= 2) && rotated;
         const double *lo = unrotated ? rot[0] : box[0];
         const double *hi = unrotated ? rot[1] : box[1];
         bool notool = (i == 1 || i == 3);
-        for(int j = 0; j < 3; j++) {
+        for(int j = 0; j < POINT_DIMS; j++) {
             double a = notool ? lo[j] + shift[j] : lo[j];
             double b = notool ? hi[j] + shift[j] : hi[j];
             if(a < data_->extents[i][0][j]) data_->extents[i][0][j] = a;
@@ -560,7 +564,7 @@ void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
 
 // The g5x XY rotation taken back out about the g5x origin, for the
 // rotation-removed extents. Z is left alone.
-void GCodeRenderer::unrotate_xy(const Point9 &p, double out[3]) const {
+void GCodeRenderer::unrotate_xy(const Point9 &p, double out[POINT_DIMS]) const {
     double tx = p[0] - g5x_[0];
     double ty = p[1] - g5x_[1];
     out[0] = tx * unrot_cos_ - ty * unrot_sin_ + g5x_[0];
