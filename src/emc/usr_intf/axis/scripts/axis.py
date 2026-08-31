@@ -3890,7 +3890,7 @@ def get_coordinate_font(large):
 
     if coordinate_font not in font_cache:
         font_cache[coordinate_font] = \
-            glnav.use_pango_font(coordinate_font, 0, 128)
+            glnav.use_pango_font(coordinate_font, 0, 256)
     fontbase, coordinate_charwidth, coordinate_linespace = \
             font_cache[coordinate_font]
 

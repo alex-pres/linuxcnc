@@ -606,7 +606,7 @@ class Lcnc_3dGraphics(QOpenGLWidget,  glcanon.GlCanonDraw, glnav.GlNavBase):
         else:
             font = self._font
             self._largeFontState = False
-        self.font_base, width, linespace = glnav.use_pango_font(font, 0, 128)
+        self.font_base, width, linespace = glnav.use_pango_font(font, 0, 256)
         self.font_linespace = linespace
         self.font_charwidth = width
         self.update()
@@ -645,6 +645,7 @@ class Lcnc_3dGraphics(QOpenGLWidget,  glcanon.GlCanonDraw, glnav.GlNavBase):
     def get_show_program(self): return self.show_program
     def get_show_rapids(self): return self.show_rapids
     def get_show_relative(self): return self.use_relative
+    def get_show_lathe_radius(self): return self.show_lathe_radius
     def get_show_tool(self): return self.show_tool
     def get_show_distance_to_go(self): return self.show_dtg
     def get_grid_size(self): return self.grid_size
@@ -745,6 +746,20 @@ class Lcnc_3dGraphics(QOpenGLWidget,  glcanon.GlCanonDraw, glnav.GlNavBase):
                 rotformat = "% 5s %1s:" + self.dro_deg
             diaformat = " " + format
 
+            # A lathe in diameter mode is asked for diameters when touching
+            # off, so the offsets it shows back are diameters too: X only, and
+            # the printed number only - stat's own values are untouched.
+            if self.is_lathe() and not self.show_lathe_radius:
+                dia_letter = "\u00d8"
+                g5x_offset = [g5x_offset[0]*2.0] + list(g5x_offset[1:])
+                g92_offset = [g92_offset[0]*2.0] + list(g92_offset[1:])
+                tlo_offset = [tlo_offset[0]*2.0] + list(tlo_offset[1:])
+            else:
+                dia_letter = None
+
+            def offset_letter(i):
+                return dia_letter if (i == 0 and dia_letter) else "XYZABCUVW"[i]
+
             posstrs = []
             droposstrs = []
             for i in range(9):
@@ -766,7 +781,7 @@ class Lcnc_3dGraphics(QOpenGLWidget,  glcanon.GlCanonDraw, glnav.GlNavBase):
                 else:
                     label = "G59.%d" % (index-6)
 
-                a = "XYZABCUVW"[i]
+                a = offset_letter(i)
                 if s.axis_mask & (1<<i):
                     droposstrs.append(offsetformat % (label, a, g5x_offset[i], a, g92_offset[i]))
             droposstrs.append(rotformat % (label, 'R', s.rotation_xy))
@@ -774,7 +789,7 @@ class Lcnc_3dGraphics(QOpenGLWidget,  glcanon.GlCanonDraw, glnav.GlNavBase):
             droposstrs.append("")
             for i in range(9):
                 if self.is_lathe() and i ==1: continue
-                a = "XYZABCUVW"[i]
+                a = offset_letter(i)
                 if s.axis_mask & (1<<i):
                     droposstrs.append(toolformat % ("TLO", a, tlo_offset[i]))
 
@@ -784,18 +799,18 @@ class Lcnc_3dGraphics(QOpenGLWidget,  glcanon.GlCanonDraw, glnav.GlNavBase):
                 if self.show_lathe_radius:
                     posstrs.insert(1, format % ("Rad", positions[0]))
                 else:
-                    posstrs.insert(1, format % ("Dia", positions[0]*2.0))
+                    posstrs.insert(1, format % ("\u00d8", positions[0]*2.0))
                 droposstrs[0] = ""
                 if self.show_dtg:
                     if self.show_lathe_radius:
                         droposstrs.insert(1, droformat % ("Rad", positions[0], "R", axisdtg[0]))
                     else:
-                        droposstrs.insert(1, droformat % ("Dia", positions[0]*2.0, "D", axisdtg[0]*2.0))
+                        droposstrs.insert(1, droformat % ("\u00d8", positions[0]*2.0, "\u00d8", axisdtg[0]*2.0))
                 else:
                     if self.show_lathe_radius:
                         droposstrs.insert(1, droformat % ("Rad", positions[0]))
                     else:
-                        droposstrs.insert(1, diaformat % ("Dia", positions[0]*2.0))
+                        droposstrs.insert(1, diaformat % ("\u00d8", positions[0]*2.0))
 
             if self.show_velocity:
                 if self.metric_units:

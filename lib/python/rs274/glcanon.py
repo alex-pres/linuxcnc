@@ -1175,7 +1175,9 @@ class GlCanonDraw:
 
         aletter = string.replace(" ","").split(":")[0]
         ans = 0
-        if (      aletter in ["X","Y","Z","A","B","C","U","V","W","Rad","Dia"]
+        # "\u00d8" is the diameter row's label on a lathe in diameter mode -
+        # the same row "Dia" labels in the base DRO.
+        if (      aletter in ["X","Y","Z","A","B","C","U","V","W","Rad","Dia","\u00d8"]
               and self.stat.kinematics_type != linuxcnc.KINEMATICS_IDENTITY
             ):
             if self.all_joints_homed():     ans = ans -2 # allhomeicon on all letters
@@ -1186,6 +1188,7 @@ class GlCanonDraw:
         if (aletter == "DTG"): return -1
         if (aletter == "Rad"): return  0
         if (aletter == "Dia"): return  0
+        if (aletter == "\u00d8"): return  0
         if self.lathe_historical_config(self.trajcoordinates):
             if (aletter == "Z"):
                 return 2 # Z for historical lathe
@@ -1212,6 +1215,13 @@ class GlCanonDraw:
         """The scene this widget draws. Overridable by a hosting GUI that wants
         a different set or order of parts."""
         return glcanon_scene.PreviewScene()
+
+    def get_show_lathe_radius(self):
+        """Whether lathe X readouts are radius. Unlike the other get_show_*
+        hooks, which every host must define, this one has a default: hosts
+        without a G7/G8 diameter toggle (AXIS, third-party embedders) keep
+        the radius behaviour they have always had."""
+        return True
 
     def frame_context(self) -> glcanon_scene.FrameContext:
         """Build the narrow context the scene parts draw from.
@@ -1242,6 +1252,7 @@ class GlCanonDraw:
             show_live_plot=self.get_show_live_plot(),
             show_relative=self.get_show_relative(),
             show_metric=self.get_show_metric(),
+            show_lathe_radius=self.get_show_lathe_radius(),
             show_small_origin=self.show_small_origin,
             program_alpha=self.get_program_alpha(),
             grid_size=self.get_grid_size(),
@@ -1416,9 +1427,9 @@ class GlCanonDraw:
 
             if self.is_lathe():
                 posstrs[0] = baseformat % ("Rad", positions[0])
-                posstrs.insert(1, baseformat % ("Dia", positions[0]*2.0))
+                posstrs.insert(1, baseformat % ("\u00d8", positions[0]*2.0))
                 droposstrs[0] = droformat % ("Rad", positions[0], "R", axisdtg[0])
-                droposstrs.insert(1, diaformat % ("Dia", positions[0]*2.0))
+                droposstrs.insert(1, diaformat % ("\u00d8", positions[0]*2.0))
 
             if self.get_show_machine_speed():
                 posstrs.append(baseformat % ("Vel", spd))

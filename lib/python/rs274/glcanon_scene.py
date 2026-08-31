@@ -196,7 +196,8 @@ class FrameContext:
         # resolved view flags
         'view', 'width', 'height', 'show_program', 'show_rapids',
         'show_extents', 'show_offsets', 'show_limits', 'show_tool',
-        'show_live_plot', 'show_relative', 'show_metric', 'show_small_origin',
+        'show_live_plot', 'show_relative', 'show_metric', 'show_lathe_radius',
+        'show_small_origin',
         'program_alpha', 'grid_size', 'highlight_line', 'enable_dro',
         'cone_basesize', 'disable_cone_scaling', 'view_tool_min_dia',
         # callables: overridable hooks and lazily-needed values
@@ -272,6 +273,10 @@ class FrameContext:
     show_live_plot: bool
     show_relative: bool
     show_metric: bool
+    #: Whether a lathe's X readouts are radius (the default) or diameter. Only
+    #: the label text and the displayed number change: world space stays
+    #: radius, so no geometry and no limit test may read this.
+    show_lathe_radius: bool
     show_small_origin: bool
     program_alpha: bool
     #: Ground-grid spacing in internal units; ``0`` means "no grid", and is the
@@ -1147,6 +1152,15 @@ class ExtentsPart(Part):
 
         machine_limit_min, machine_limit_max = ctx.limits
 
+        # A lathe in diameter mode reads X as a diameter, so the X extent
+        # numbers are doubled and marked. This scales the printed number only -
+        # never a translate, never a limit test, which stay in world (radius)
+        # space with the path they annotate.
+        if ctx.is_lathe and not ctx.show_lathe_radius:
+            xscale, xmark = 2.0, '\u00d8'
+        else:
+            xscale, xmark = 1.0, ''
+
         pullback = max(g.max_extents[X] - g.min_extents[X],
                        g.max_extents[Y] - g.min_extents[Y],
                        g.max_extents[Z] - g.min_extents[Z],
@@ -1297,7 +1311,7 @@ class ExtentsPart(Part):
             #X MIN extent
             bbox = ctx.color_limit(g.min_extents_notool[X] < machine_limit_min[X])
             with ctx.mv.push():
-                f = fmt % ((g.min_extents[X] - offset[X]) * dimscale)
+                f = xmark + fmt % ((g.min_extents[X] - offset[X]) * dimscale * xscale)
                 ctx.mv.translate(g.min_extents[X] - halfchar, y_pos, z_pos)
                 ctx.mv.rotate(-90, 0, 0, 1)
                 if view == VY:
@@ -1308,7 +1322,7 @@ class ExtentsPart(Part):
             #X MAX extent
             bbox = ctx.color_limit(g.max_extents_notool[X] > machine_limit_max[X])
             with ctx.mv.push():
-                f = fmt % ((g.max_extents[X] - offset[X]) * dimscale)
+                f = xmark + fmt % ((g.max_extents[X] - offset[X]) * dimscale * xscale)
                 ctx.mv.translate(g.max_extents[X] - halfchar, y_pos, z_pos)
                 ctx.mv.rotate(-90, 0, 0, 1)
                 if view == VY:
@@ -1320,7 +1334,7 @@ class ExtentsPart(Part):
             ctx.color_limit(0)
             with ctx.mv.push():
                 #X midpoint
-                f = fmt % ((g.max_extents[X] - g.min_extents[X]) * dimscale)
+                f = fmt % ((g.max_extents[X] - g.min_extents[X]) * dimscale * xscale)
                 ctx.mv.translate((g.max_extents[X] + g.min_extents[X])/2, y_pos,
                             z_pos)
                 if view == VY:

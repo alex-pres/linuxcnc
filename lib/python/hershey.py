@@ -16,9 +16,27 @@
 #    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 import itertools
+import math
 
 translate = {'0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, '-': 10, '.': 11, 'X': 12, 'Y': 13, 'Z': 14, 'G': 15,
-        'U': 16, 'V': 17, 'W': 18}
+        'U': 16, 'V': 17, 'W': 18,
+        '\u00d8': 19,     # LATIN CAPITAL LETTER O WITH STROKE - what is emitted
+        '\u2300': 19}    # DIAMETER SIGN - accepted as an alias, never emitted
+
+
+def _circle_polyline(cx, cy, r, segments=24):
+    """A closed circle as a single stroke in 440-space.
+
+    Written as code rather than as a literal point tuple so the diameter
+    glyph below reads as what it is - the other glyphs are digitised strokes
+    and have no such shape to state.
+    """
+    pts = []
+    for i in range(segments + 1):
+        theta = 2.0 * math.pi * i / segments
+        pts.append((cx + r * math.cos(theta), cy + r * math.sin(theta)))
+    return pts
+
 
 class Hershey:
     def __init__(self):
@@ -102,6 +120,12 @@ class Hershey:
         [[(60, 20), (60, 400), (100, 440), (160, 440), (200, 400),
           (240, 440), (300, 440), (340, 400), (340, 20)],
          [(200, 400), (200, 300)]],
+    # \u00d8 - the diameter sign, drawn beside a lathe X value in diameter
+    # mode. Sized to sit at digit cap height: the digits span y 20..440 and
+    # x 120..400, so a circle of r=170 about (250, 230) matches them, with the
+    # slash overshooting it at both ends.
+        [_circle_polyline(250.0, 230.0, 170.0, 24),
+         [(100.0, 410.0), (400.0, 50.0)]],
        )
         # The preview renderer draws Hershey glyphs through the line shader via
         # string_polylines(); the legacy per-glyph GL display lists (glGenLists/

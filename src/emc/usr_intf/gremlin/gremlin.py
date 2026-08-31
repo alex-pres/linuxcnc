@@ -188,6 +188,9 @@ class Gremlin(Gtk.DrawingArea,rs274.glcanon.GlCanonDraw,glnav.GlNavBase):
     display = Xlib.display.Display()
     attrs = []
     rotation_vectors = [(1.,0.,0.), (0.,0.,1.)]
+    #: Bare Gremlin has no diameter toggle; hal_gremlin's gproperty of the same
+    #: name shadows this for the GTK screens that do.
+    show_lathe_radius = True
     
     def add_attribute(self, setting, value):
         self.attrs.append(setting)
@@ -478,7 +481,7 @@ class Gremlin(Gtk.DrawingArea,rs274.glcanon.GlCanonDraw,glnav.GlNavBase):
             return
         self._current_file = None
 
-        self.font_base, width, linespace = glnav.use_pango_font('monospace 16', 0, 128)
+        self.font_base, width, linespace = glnav.use_pango_font('monospace 16', 0, 256)
         self.font_linespace = linespace
         self.font_charwidth = width
         rs274.glcanon.GlCanonDraw.realize(self)
@@ -635,6 +638,7 @@ class Gremlin(Gtk.DrawingArea,rs274.glcanon.GlCanonDraw,glnav.GlNavBase):
     def get_show_program(self): return self.show_program
     def get_show_rapids(self): return self.show_rapids
     def get_show_relative(self): return self.use_relative
+    def get_show_lathe_radius(self): return self.show_lathe_radius
     def get_show_tool(self): return self.show_tool
     def get_show_distance_to_go(self): return self.show_dtg
     def get_grid_size(self): return self.grid_size

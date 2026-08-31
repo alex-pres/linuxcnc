@@ -207,6 +207,20 @@ class HAL_Gremlin(gremlin.Gremlin, _EMC_ActionBase):
                 rotformat = "% 5s %1s:% 9.4f"
             diaformat = " " + format
 
+            # A lathe in diameter mode is asked for diameters when touching
+            # off, so the offsets it shows back are diameters too: X only, and
+            # the printed number only - stat's own values are untouched.
+            if self.is_lathe() and not self.show_lathe_radius:
+                dia_letter = "\u00d8"
+                g5x_offset = [g5x_offset[0]*2.0] + list(g5x_offset[1:])
+                g92_offset = [g92_offset[0]*2.0] + list(g92_offset[1:])
+                tlo_offset = [tlo_offset[0]*2.0] + list(tlo_offset[1:])
+            else:
+                dia_letter = None
+
+            def offset_letter(i):
+                return dia_letter if (i == 0 and dia_letter) else "XYZABCUVW"[i]
+
             posstrs = []
             droposstrs = []
             for i in range(9):
@@ -226,14 +240,14 @@ class HAL_Gremlin(gremlin.Gremlin, _EMC_ActionBase):
                 else:
                     label = "G59.%d" % (index-6)
 
-                a = "XYZABCUVW"[i]
+                a = offset_letter(i)
                 if s.axis_mask & (1<<i):
                     droposstrs.append(offsetformat % (label, a, g5x_offset[i], a, g92_offset[i]))
             droposstrs.append(rotformat % (label, 'R', s.rotation_xy))
 
             droposstrs.append("")
             for i in range(9):
-                a = "XYZABCUVW"[i]
+                a = offset_letter(i)
                 if s.axis_mask & (1<<i):
                     droposstrs.append(rotformat % ("TLO", a, tlo_offset[i]))
 
@@ -243,18 +257,18 @@ class HAL_Gremlin(gremlin.Gremlin, _EMC_ActionBase):
                 if self.show_lathe_radius:
                     posstrs.insert(1, format % ("Rad", positions[0]))
                 else:
-                    posstrs.insert(1, format % ("Dia", positions[0]*2.0))
+                    posstrs.insert(1, format % ("\u00d8", positions[0]*2.0))
                 droposstrs[0] = ""
                 if self.show_dtg:
                     if self.show_lathe_radius:
                         droposstrs.insert(1, droformat % ("Rad", positions[0], "R", axisdtg[0]))
                     else:
-                        droposstrs.insert(1, droformat % ("Dia", positions[0]*2.0, "D", axisdtg[0]*2.0))
+                        droposstrs.insert(1, droformat % ("\u00d8", positions[0]*2.0, "\u00d8", axisdtg[0]*2.0))
                 else:
                     if self.show_lathe_radius:
                         droposstrs.insert(1, droformat % ("Rad", positions[0]))
                     else:
-                        droposstrs.insert(1, diaformat % ("Dia", positions[0]*2.0))
+                        droposstrs.insert(1, diaformat % ("\u00d8", positions[0]*2.0))
 
             if self.show_velocity:
                 posstrs.append(format % ("Vel", spd))
