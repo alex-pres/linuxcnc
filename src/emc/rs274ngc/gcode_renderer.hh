@@ -481,6 +481,11 @@ private:
 
     Point9 lo_ = {};                    // chain point
     Point9 tool_ = {};                  // xo..wo
+    // The cut_length slot the last feed move landed in, so a run at one feed
+    // rate does not look the same key up once per move. Invalidated by any
+    // write to the map itself.
+    double *cut_slot_ = nullptr;
+    double cut_rate_ = 0.0;
     bool first_move_ = true;
     // The `(AXIS,hide)` depth, counted here from the comments themselves.
     // A parse starts at zero: a canon that set `suppress` before the parse

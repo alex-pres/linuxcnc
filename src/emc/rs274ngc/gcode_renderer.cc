@@ -699,38 +699,41 @@ void GCodeRenderer::mark(int line_number, const Point9 &at,
 
 // The four machine-frame extent pairs, from one move's raw endpoints.
 void GCodeRenderer::accumulate_extents(const Point9 &p1, const Point9 &p2) {
-    Box3 box;
+    // Branchless min/max throughout: which end of a move is the lower one,
+    // and whether it widens the box, are both unpredictable, and this runs
+    // once per move.
+    double lo[P3_COUNT], hi[P3_COUNT];
     for(int j = 0; j < P3_COUNT; j++) {
-        box[BOX_MIN][j] = std::min(p1[j], p2[j]);
-        box[BOX_MAX][j] = std::max(p1[j], p2[j]);
+        lo[j] = std::fmin(p1[j], p2[j]);
+        hi[j] = std::fmax(p1[j], p2[j]);
     }
     // The tool-corrected box is the raw box shifted: adding a constant is
     // monotonic, so this is the same box, not an approximation of it.
-    Point3 shift = {tool_[P9_X], tool_[P9_Y], tool_[P9_Z]};
-    Box3 rot;
-    if(rotation_xy_ != 0.0) {
+    const double *shift = &tool_[P9_X];
+
+    double rlo[P3_COUNT], rhi[P3_COUNT];
+    const bool rotated = rotation_xy_ != 0.0;
+    if(rotated) {
         Point3 u1, u2;
         unrotate_xy(p1, u1);
         unrotate_xy(p2, u2);
         for(int j = 0; j < P3_COUNT; j++) {
-            rot[BOX_MIN][j] = std::min(u1[j], u2[j]);
-            rot[BOX_MAX][j] = std::max(u1[j], u2[j]);
+            rlo[j] = std::fmin(u1[j], u2[j]);
+            rhi[j] = std::fmax(u1[j], u2[j]);
         }
     }
     // With no rotation to remove, the zero_rxy kinds are the plain ones.
-    bool rotated = rotation_xy_ != 0.0;
     for(int i = 0; i < EXTENT_KINDS; i++) {
-        bool unrotated = (i >= EXT_ZERO_RXY) && rotated;
-        const Point3 &lo = unrotated ? rot[BOX_MIN] : box[BOX_MIN];
-        const Point3 &hi = unrotated ? rot[BOX_MAX] : box[BOX_MAX];
-        bool notool = (i == EXT_NOTOOL || i == EXT_NOTOOL_ZERO_RXY);
+        const bool unrotated = (i >= EXT_ZERO_RXY) && rotated;
+        const double *l = unrotated ? rlo : lo;
+        const double *h = unrotated ? rhi : hi;
+        const bool notool = (i == EXT_NOTOOL || i == EXT_NOTOOL_ZERO_RXY);
+        double *emin = data_->extents[i][BOX_MIN].data();
+        double *emax = data_->extents[i][BOX_MAX].data();
         for(int j = 0; j < P3_COUNT; j++) {
-            double a = notool ? lo[j] + shift[j] : lo[j];
-            double b = notool ? hi[j] + shift[j] : hi[j];
-            if(a < data_->extents[i][BOX_MIN][j])
-                data_->extents[i][BOX_MIN][j] = a;
-            if(b > data_->extents[i][BOX_MAX][j])
-                data_->extents[i][BOX_MAX][j] = b;
+            const double d = notool ? shift[j] : 0.0;
+            emin[j] = std::fmin(emin[j], l[j] + d);
+            emax[j] = std::fmax(emax[j], h[j] + d);
         }
     }
 }
@@ -754,7 +757,16 @@ void GCodeRenderer::fill(int line_number, const Point9 &p1, const Point9 &p2,
            dz = p2[P9_Z] - p1[P9_Z];
     double len = sqrt(dx * dx + dy * dy + dz * dz);
     if(cat == CAT_TRAVERSE) data_->rapid_length += len;
-    else data_->cut_length[feedrate] += len;
+    else {
+        // The feed rate holds for runs of thousands of moves, so the map node
+        // found last time is almost always the one wanted; the lookup it
+        // replaces is a red-black descent per move.
+        if(!cut_slot_ || cut_rate_ != feedrate) {
+            cut_slot_ = &data_->cut_length[feedrate];
+            cut_rate_ = feedrate;
+        }
+        *cut_slot_ += len;
+    }
 
     // A move that does not start where the last one ended gets a record vertex
     // at its start; the shaders discard the segment into it.
