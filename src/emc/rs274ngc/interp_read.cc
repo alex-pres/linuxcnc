@@ -3174,17 +3174,23 @@ int Interp::read_text(
       }
     }
     _setup.sequence_number++;   /* moved from version1, was outside if */
-    if (strlen(raw_line) == (LINELEN - 1)) { // line is too long. need to finish reading the line to recover
+    // One strlen for the whole block: the length only shrinks from here, and
+    // the trailing-space trim tracks it.
+    size_t raw_len = strlen(raw_line);
+    if (raw_len == (LINELEN - 1)) { // line is too long. need to finish reading the line to recover
       for (; fgetc(inport) != '\n' && !feof(inport) ;) {
       }
       ERS(NCE_COMMAND_TOO_LONG);
     }
-    for (index = (strlen(raw_line) - 1);        // index set on last char
+    for (index = (int)raw_len - 1;              // index set on last char
          (index >= 0) && (isspace(raw_line[index]));
          index--) { // remove space at end of raw_line, especially CR & LF
       raw_line[index] = 0;
     }
-    rs274ngc_strlcpy(line, raw_line, LINELEN);
+    raw_len = (size_t)(index + 1);
+    // memcpy, not strncpy: strncpy zero-fills the rest of the 255-byte
+    // destination, and a G-code line is a tenth of that.
+    memcpy(line, raw_line, raw_len + 1);
     CHP(close_and_downcase(line));
     if ((line[0] == '%') && (line[1] == 0) && (_setup.percent_flag)) {
         FINISH();
