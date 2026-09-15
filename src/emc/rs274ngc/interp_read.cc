@@ -2750,8 +2750,14 @@ int Interp::read_real_number(char *line, //!< string: line of RS274/NGC code bei
 
   start = line + *counter;
 
-  size_t signs = strspn(start, "+-");
-  after = strspn(start+signs, "0123456789.") + signs;
+  // Hand-rolled rather than strspn(): glibc builds a 256-bit table of the
+  // accept set on every call, which costs more than the five or six digits a
+  // G-code number actually spans.
+  const char *p = start;
+  while (*p == '+' || *p == '-') p++;
+  size_t signs = p - start;
+  while ((*p >= '0' && *p <= '9') || *p == '.') p++;
+  after = p - start;
 
   const char *first = start + ((signs == 1 && *start == '+') ? 1 : 0);
   const char *last = start + after;
