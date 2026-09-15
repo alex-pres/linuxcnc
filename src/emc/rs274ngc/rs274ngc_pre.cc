@@ -647,6 +647,12 @@ int Interp::remap_finished(int phase)
 // return number of remaps found
 int Interp::find_remappings(block_pointer block, setup_pointer settings)
 {
+    // Nothing was remapped, so nothing in this block can be: the dozen
+    // predicates below each walk a map or compare strings, and they run per
+    // block whether or not the INI carried a single REMAP= line.
+    if (settings->remaps.empty())
+	return block->remappings.size();
+
     if (block->f_flag && remapping("F")) {
 	if (remap_in_progress("F"))
 	    CONTROLLING_BLOCK(*settings).builtin_used = true;

@@ -900,6 +900,16 @@ macros totally crash-proof. If the function call stack is deeper than
 #include <assert.h>
 #include <type_traits>
 
+// A remap table read that neither inserts nor descends a tree when nothing is
+// remapped, which is every config without a REMAP= line. std::map::operator[]
+// does both: it inserts a null-valued node for each code looked up, so a
+// program's G and M words grew the table they were querying.
+static inline remap_pointer remap_lookup(const int_remap_map &m, int code) {
+    if (m.empty()) return nullptr;
+    int_remap_map::const_iterator it = m.find(code);
+    return it == m.end() ? nullptr : it->second;
+}
+
 static inline void rs274ngc_strlcpy(char *dst, const char *src, size_t dstsize) {
     strncpy(dst, src, dstsize);
     dst[dstsize-1] = 0;

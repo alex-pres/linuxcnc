@@ -58,10 +58,15 @@ bool Interp::is_m_code_remappable(int m_code)
 
 bool Interp::is_any_m_code_remapped(block_pointer block, setup_pointer settings)
 {
+    // Checked per block, so the common answer is worth one load: with nothing
+    // remapped the loop below can only reach the same conclusion eleven times
+    // more slowly.
+    if (settings->m_remapped.empty())
+	return false;
     for (const int m_mode : block->m_modes) {
 	if (m_mode == -1)
             continue;
-        if (is_m_code_remappable(m_mode) && settings->m_remapped[m_mode])
+        if (is_m_code_remappable(m_mode) && remap_lookup(settings->m_remapped, m_mode))
 	    return true;
     }
     return false;
@@ -72,14 +77,14 @@ bool Interp::is_user_defined_m_code(block_pointer block, setup_pointer settings,
     const int m_code = block->m_modes[m_group];
     if (m_code < 0) return false;
 
-    return (is_m_code_remappable(m_code) && settings->m_remapped[m_code]);
+    return (is_m_code_remappable(m_code) && remap_lookup(settings->m_remapped, m_code));
 }
 
 bool Interp::is_g_code_remappable(int g_code)
 { return g_code > 0 && g_code < 1000 && gees[g_code] == -1; }
 
 bool Interp::is_user_defined_g_code(int g_code)
-{ return is_g_code_remappable(g_code) && _setup.g_remapped[g_code]; }
+{ return is_g_code_remappable(g_code) && remap_lookup(_setup.g_remapped, g_code); }
 
 bool Interp::remap_in_progress(const char *code)
 {
@@ -117,10 +122,10 @@ int Interp::convert_remapped_code(block_pointer /*block*/,
 
     switch (toupper(letter)) {
     case 'M':
-	remap = settings->m_remapped[number];
+	remap = remap_lookup(settings->m_remapped, number);
 	break;
     case 'G':
-	remap = settings->g_remapped[number];
+	remap = remap_lookup(settings->g_remapped, number);
 	break;
     default:
 	key[0] = letter;
